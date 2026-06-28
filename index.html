@@ -1378,7 +1378,7 @@ async function loadConversations() {
     list.innerHTML = convs.map(c => `
       <button onclick="selectConversation('${c.id}')" class="w-full text-left p-3 bg-card hover:bg-surface rounded-lg border border-border/50 hover:border-accent/30 transition text-xs">
         <div class="text-white font-medium truncate">${c.title || 'Untitled Chat'}</div>
-        <div class="text-gray-500 text-[10px] mt-1">${c.created || 'No date'}</div>
+        <div class="text-gray-500 text-[10px] mt-1">${formatDate(c.created_at) || 'No date'}</div>
       </button>
     `).join('');
   } catch (err) {
