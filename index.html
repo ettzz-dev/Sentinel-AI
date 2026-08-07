@@ -1,4 +1,4 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en" class="h-full">
 
   <head>
@@ -1611,34 +1611,36 @@
       // Send message to AI API
       async function sendMessage(message) {
         try {
+          
           // -- Show loading state
           const loadingId = "chat-loading-" + Date.now();
           // -- Add loading bubble to both main chat and widget
           const mainMsgs = document.getElementById("chatMessages");
           // -- Add loading bubble to both main chat and widget
           const widgetMsgs = document.getElementById("widgetMessages");
-          // -- Define loading bubble HTML
-          const loadingHTML = `  
-
-        <!-- AI Chat Bubble Container ------->
-          <div class="bg-[#111827] px-5 py-4 rounded-2xl rounded-bl-sm flex items-center gap-1.5 shadow-xl border border-[#202024]">
-            <div class="w-2 h-2 bg-gray-400 rounded-full animate-ai-bounce delay-1"></div>
-            <div class="w-2 h-2 bg-gray-400 rounded-full animate-ai-bounce delay-2"></div>
-            <div class="w-2 h-2 bg-gray-400 rounded-full animate-ai-bounce"></div>
+          // Replace the loadingHTML variable inside sendMessage() with: (Define loading bubble HTML)
+          const loadingHTML = `
+          
+          <!-- AI Chat Bubble Container ------->
+          <div id="${loadingId}" class="bg-[#111827] px-5 py-4 rounded-2xl rounded-bl-sm flex items-center gap-1.5 shadow-xl border border-[#202024]">
+          <div class="w-2 h-2 bg-gray-400 rounded-full animate-ai-bounce delay-1"></div>
+          <div class="w-2 h-2 bg-gray-400 rounded-full animate-ai-bounce delay-2"></div>
+          <div class="w-2 h-2 bg-gray-400 rounded-full animate-ai-bounce"></div>
           </div>`;
+          
           // -- Add loading bubble to main chat
           if (mainMsgs) {
-            // -- Add loading bubble to main chat
-            mainMsgs.innerHTML += loadingHTML;
-            // -- Scroll to bottom of main chat messages
-            mainMsgs.scrollTop = mainMsgs.scrollHeight;
+          // -- Add loading bubble to main chat
+          mainMsgs.innerHTML += loadingHTML;
+          // -- Scroll to bottom of main chat messages
+          mainMsgs.scrollTop = mainMsgs.scrollHeight;
           }
           // -- Add loading bubble to widget
           if (widgetMsgs) {
-            // -- Add loading bubble to widget
-            widgetMsgs.innerHTML += loadingHTML;
-            // -- Scroll to bottom of widget messages
-            widgetMsgs.scrollTop = widgetMsgs.scrollHeight;
+          // -- Add loading bubble to widget
+          widgetMsgs.innerHTML += loadingHTML;
+            / -- Scroll to bottom of widget messages
+          widgetMsgs.scrollTop = widgetMsgs.scrollHeight;
           }
           // -- Update icons after adding loading bubble
           lucide.createIcons();
