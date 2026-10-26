@@ -1,0 +1,103 @@
+/* Sentinel touch: additive polish for the chat tab.
+   Remove the <link> to this file to undo everything. */
+
+:root {
+  --st-signal: #34d399;            /* same emerald as "Link Status: Established" */
+  --st-ink: #e2e8f0;
+  --st-muted: #94a3b8;
+  --st-surface: #0b1220;
+  --st-line: rgba(148, 163, 184, 0.22);
+  --st-accent: #a78bfa;            /* same purple as your input focus */
+}
+
+/* Quiet the greeting: it pulsed forever, which pulls the eye away from the chat */
+#mainGreeting.animate-pulse { animation: none; }
+
+/* ---- Working indicator: a trace reaching its target, one hop at a time ---- */
+.st-thinking { display: flex; align-items: center; gap: 0.75rem; }
+.st-hops { display: inline-flex; align-items: center; }
+.st-hop {
+  position: relative;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #334155;
+  animation: st-hop 1.2s ease-in-out infinite;
+}
+.st-hop + .st-hop { margin-left: 20px; }
+.st-hop + .st-hop::before {
+  content: ""; position: absolute; right: 100%; top: 50%;
+  width: 20px; height: 1px; background: var(--st-line);
+}
+.st-hop:nth-child(2) { animation-delay: 0.2s; }
+.st-hop:nth-child(3) { animation-delay: 0.4s; }
+.st-hop:nth-child(4) { animation-delay: 0.6s; }
+@keyframes st-hop {
+  0%, 60%, 100% { background: #334155; box-shadow: none; }
+  25% { background: var(--st-signal); box-shadow: 0 0 8px var(--st-signal); }
+}
+
+/* ---- Model commands menu ---- */
+#chatForm { position: relative; }
+.st-palette {
+  position: absolute; left: 0; bottom: calc(100% + 6px);
+  min-width: min(340px, 100%);
+  padding: 4px; z-index: 30;
+  background: var(--st-surface);
+  border: 1px solid var(--st-line); border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.st-palette[hidden] { display: none; }
+.st-opt {
+  display: flex; align-items: baseline; gap: 0.75rem;
+  width: 100%; padding: 0.5rem 0.65rem;
+  border-radius: 7px; text-align: left;
+  color: var(--st-ink); font-size: 0.8rem; cursor: pointer;
+}
+.st-opt code { color: var(--st-accent); font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+.st-opt small { color: var(--st-muted); font-size: 0.75rem; }
+.st-opt[aria-selected="true"] { background: rgba(167, 139, 250, 0.14); }
+
+/* ---- Copy button on code blocks ---- */
+.st-code { position: relative; margin: 0.5em 0; }
+.st-code > pre { margin: 0; }
+.st-copy {
+  position: absolute; top: 6px; right: 6px;
+  padding: 0.2rem 0.55rem; font-size: 0.7rem;
+  color: var(--st-muted); background: rgba(15, 23, 42, 0.92);
+  border: 1px solid var(--st-line); border-radius: 6px;
+  cursor: pointer; opacity: 0; transition: opacity 0.15s;
+}
+.st-code:hover .st-copy, .st-copy:focus-visible { opacity: 1; }
+@media (hover: none) { .st-copy { opacity: 1; } }
+.st-copy:hover { color: var(--st-ink); }
+
+/* ---- Drop zone ---- */
+.st-drop {
+  position: fixed; inset: 0; z-index: 60;
+  display: none; place-items: center; pointer-events: none;
+  background: rgba(2, 6, 23, 0.74);
+}
+body.st-dropping .st-drop { display: grid; }
+.st-drop > div {
+  display: grid; gap: 0.35rem; text-align: center;
+  padding: 2rem 3rem; color: var(--st-ink);
+  border: 1.5px dashed var(--st-signal); border-radius: 14px;
+}
+.st-drop strong { font-size: 1.05rem; }
+.st-drop span { color: var(--st-muted); font-size: 0.8rem; }
+
+/* ---- Keyboard focus + reduced motion ---- */
+.st-opt:focus-visible, .st-copy:focus-visible { outline: 2px solid var(--st-accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .st-hop { animation: none; }
+  .st-hop:last-child { background: var(--st-signal); }
+}
+
+/* ---- Attachment chips (this class was used by app.js but had no style) ---- */
+.file-preview-chip {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.25rem 0.5rem; font-size: 0.75rem;
+  color: var(--st-ink); background: rgba(15, 23, 42, 0.8);
+  border: 1px solid var(--st-line); border-radius: 8px;
+}
+.file-preview-chip button { display: inline-flex; color: var(--st-muted); cursor: pointer; }
+.file-preview-chip button:hover { color: var(--st-ink); }

@@ -1,0 +1,103 @@
+/* ============================================================
+   Collapsible icon-rail sidebar (desktop only, >= 1024px)
+   - .is-collapsed : 64px rail, icons only
+   - .is-peek      : hovering a collapsed rail expands it as an
+                     overlay (content underneath doesn't move)
+   Mobile drawer behaviour is untouched.
+   ============================================================ */
+@media (min-width: 1024px) {
+    #sidebar {
+        position: relative;
+        width: 14rem;
+        transition:
+            width 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+            margin-right 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+            box-shadow 0.22s ease;
+    }
+
+    /* No animation on page load when restoring saved state */
+    #sidebar.rail-no-anim,
+    #sidebar.rail-no-anim * {
+        transition: none !important;
+    }
+
+    /* Collapsed rail */
+    #sidebar.is-collapsed {
+        width: 4rem;
+    }
+
+    /* Hover peek: grow to full width but give the extra space back with a
+       negative margin, so it floats over the page instead of pushing it */
+    #sidebar.is-collapsed.is-peek {
+        width: 14rem;
+        margin-right: -10rem;
+        z-index: 50;
+        box-shadow:
+            14px 0 40px rgba(0, 0, 0, 0.5),
+            1px 0 0 rgba(0, 229, 255, 0.25);
+    }
+
+    /* Labels get clipped rather than wrapping while the width animates */
+    #sidebar #navList {
+        overflow-x: hidden;
+    }
+    #sidebar .nav-item,
+    #sidebar .brand-header {
+        white-space: nowrap;
+        overflow: hidden;
+    }
+
+    /* Keep icons at full size; let the label shrink/clip instead.
+       (Without this, flexbox squashes the icon to 0px in the rail.) */
+    #sidebar .nav-item > svg,
+    #sidebar .nav-item > i {
+        flex-shrink: 0;
+    }
+    #sidebar .nav-item > span {
+        min-width: 0;
+    }
+
+    /* Fade labels out when collapsed (icons stay put).
+       Only elements tagged .rail-hide fade; the icon lives inside a
+       nested row now, so we must NOT hide whole direct children of
+       .nav-item (that was hiding the icon along with the label). */
+    #sidebar .rail-hide {
+        transition: opacity 0.15s ease;
+    }
+    #sidebar.is-collapsed:not(.is-peek) .rail-hide {
+        opacity: 0;
+        pointer-events: none;
+    }
+
+    /* Centre the icon in the 64px rail (16px icon -> 24px each side) */
+    #sidebar .nav-item {
+        transition: padding-left 0.22s cubic-bezier(0.4, 0, 0.2, 1), background 0.2s;
+    }
+    #sidebar.is-collapsed:not(.is-peek) .nav-item {
+        padding-left: 1.5rem;
+    }
+    #sidebar.is-collapsed:not(.is-peek) .nav-item.active {
+        padding-left: calc(1.5rem - 3px); /* compensate the 3px active border */
+    }
+
+    /* Footer stacks vertically in the rail: status dot above the toggle */
+    #sidebar.is-collapsed:not(.is-peek) .rail-footer {
+        flex-direction: column;
+        gap: 0.6rem;
+    }
+    #sidebar.is-collapsed:not(.is-peek) .rail-footer .rail-hide {
+        display: none;
+    }
+
+    /* Toggle chevron flips direction */
+    #railToggleBtn svg {
+        transition: transform 0.22s ease;
+    }
+    #sidebar.is-collapsed #railToggleBtn svg {
+        transform: rotate(180deg);
+    }
+
+    /* OPTIONAL: if your nav icons look off-centre in the rail, tweak this.
+       #sidebar.is-collapsed:not(.is-peek) .nav-item { padding-left: 1.375rem !important; }
+    */
+}
