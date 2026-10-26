@@ -25,7 +25,10 @@ if (!function_exists('log_error')) {
 
         $context['uri'] = $context['uri'] ?? (($_SERVER['REQUEST_METHOD'] ?? 'CLI') . ' ' . ($_SERVER['REQUEST_URI'] ?? ($_SERVER['SCRIPT_NAME'] ?? '')));
 
-        $line = '[' . date('c') . "] $level: $message "
+        // Log in SAST regardless of PHP's default timezone
+        $time = (new DateTimeImmutable('now', new DateTimeZone('Africa/Johannesburg')))->format('c');
+
+        $line = "[$time] $level: $message "
               . json_encode($context, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE)
               . PHP_EOL;
 
