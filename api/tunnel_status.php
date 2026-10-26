@@ -4,12 +4,15 @@ ini_set('display_errors', 1);
 ini_set('display_startup_errors', 1);
 error_reporting(E_ALL);
 
+require_once __DIR__ . '/../config/logger.php';
+
 header('Content-Type: application/json');
 
 $apiKey    = getenv('CLOUDFLARE_API_KEY');
 $accountId = getenv('CLOUDFLARE_ACCOUNT_ID');
 
 if (!$apiKey || !$accountId) {
+    log_error('Cloudflare env vars missing', ['CLOUDFLARE_API_KEY' => (bool)$apiKey, 'CLOUDFLARE_ACCOUNT_ID' => (bool)$accountId]);
     http_response_code(500);
 
     echo json_encode([
@@ -37,6 +40,7 @@ $response = curl_exec($ch);
 
 if (curl_errno($ch)) {
 
+    log_error('Cloudflare API request failed: ' . curl_error($ch));
     http_response_code(500);
 
     echo json_encode([
@@ -54,6 +58,7 @@ curl_close($ch);
 
 if ($httpCode !== 200) {
 
+    log_error("Cloudflare API returned HTTP $httpCode", ['body' => substr((string)$response, 0, 500)]);
     http_response_code($httpCode);
 
     echo json_encode([

@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/logger.php';
+
 // Check if environment variables exist, otherwise use local defaults
 $db    = getenv('DB_NAME') ?: 'ettzz_db';
 $user  = getenv('DB_USER') ?: 'root';
@@ -24,6 +26,7 @@ try {
     // Optional: Echo this to verify it finally worked when testing
     // echo "Connected successfully!"; 
 } catch (PDOException $e) {
+    log_exception($e, 'Database connection failed', ['host' => $host, 'db' => $db]);
     die("Database connection failed: " . $e->getMessage());
 }
 

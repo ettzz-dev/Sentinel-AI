@@ -24,6 +24,7 @@ $apiKey = $_SERVER['ANTHROPIC_API_KEY']
     ?? getenv('ANTHROPIC_API_KEY');
 
 if (empty($apiKey)) {
+    log_error('ANTHROPIC_API_KEY not configured');
     http_response_code(500);
     echo json_encode(['status' => 'error', 'error' => 'ANTHROPIC_API_KEY not configured. Verify VirtualHost SetEnv settings.']);
     exit;
@@ -218,6 +219,7 @@ try {
             $mcpMap   = $info['map'];
             $mcpDebug = ['loaded' => $info['loaded'], 'blocked' => $info['blocked'], 'error' => $info['error']];
         } catch (\Throwable $e) {
+            log_exception($e, 'MCP tool discovery failed');
             $mcpDebug['error'] = $e->getMessage();
         }
     }
@@ -351,6 +353,7 @@ if (isset($res['ok']) && $res['ok'] === false) {
                     $out = "Unknown or unavailable tool: $name"; $isErr = true;
                 }
             } catch (\Throwable $e) {
+                log_exception($e, "Tool '$name' failed", ['conversation_id' => $conversationId]);
                 $out = 'Tool error: ' . $e->getMessage(); $isErr = true;
             }
 
@@ -383,6 +386,7 @@ if (isset($res['ok']) && $res['ok'] === false) {
     ], JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_UNICODE);
 
 } catch (\Throwable $e) {
+    log_exception($e, 'Chat request failed', ['conversation_id' => $conversationId, 'model' => $selectedModel]);
     http_response_code(500);
     echo json_encode(['success' => false, 'status' => 'error', 'error' => $e->getMessage()]);
 }

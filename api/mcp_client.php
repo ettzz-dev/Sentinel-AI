@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/../config/logger.php';
+
 /**
  *   MCP_URL     optional, defaults to https://mcp.ettzz.pro/mcp
  *   MCP_ALLOW   optional, comma list of EXACT tool names Sentinel may use.
@@ -47,6 +49,7 @@ class McpClient
 
     private function err(int $code, string $msg): array
     {
+        log_error("MCP request failed: $msg", ['code' => $code, 'url' => $this->targetUrl]);
         return ['error' => ['code' => $code, 'message' => $msg]];
     }
 

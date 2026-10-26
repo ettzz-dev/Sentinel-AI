@@ -22,6 +22,7 @@ if ($action === 'load_conversations') {
             "conversations" => $conversations
         ]);
     } catch (PDOException $e) {
+        log_exception($e, 'Loading conversations failed');
         echo json_encode([
             "success" => false,
             "error" => $e->getMessage()
