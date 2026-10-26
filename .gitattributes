@@ -1,0 +1,2 @@
+# Runs on OpenWrt: must keep LF line endings even on Windows checkouts
+deploy/routerpi/sentinel-stats text eol=lf

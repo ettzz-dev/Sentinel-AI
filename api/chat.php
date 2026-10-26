@@ -225,6 +225,12 @@ try {
         $mcpNote = "\n\nGATEWAY ACCESS: You have read-only access to the user's OpenWrt gateway through the tools whose names start with owrt_. "
                  . 'Use them when the user asks about the gateway, network status, clients, interfaces, logs or connectivity, and base your answer on the real tool output. '
                  . 'You cannot change anything on the gateway; never claim you did. Never reveal secrets that appear in tool output.';
+        if (isset($mcpMap['owrt_get-routerpi-status'])) {
+            $mcpNote .= ' RouterPi is the OpenWrt Raspberry Pi in the car (UPS HAT battery, SIM7600 LTE modem, separate GPS module). '
+                      . 'Use owrt_get-routerpi-status for its battery, LTE signal, CPU, memory, temperature or uptime. '
+                      . 'LTE RSRP guide: >= -80 dBm excellent, -80 to -90 good, -90 to -100 fair, < -100 poor; SINR > 20 dB excellent, 13-20 good, 0-13 fair, < 0 poor. '
+                      . 'If the tool fails, say the car may be off or out of coverage rather than guessing values.';
+        }
     }
 
     date_default_timezone_set('Africa/Johannesburg');

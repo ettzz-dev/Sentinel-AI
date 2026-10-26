@@ -1,0 +1,183 @@
+#!/bin/sh
+# Sentinel RouterPi stats: read-only JSON snapshot for the Sentinel MCP Worker.
+#
+# Install on the Pi as /www/cgi-bin/sentinel-stats (chmod 755).
+# Requires: i2c-tools, sms-tool, kmod-i2c-bcm2835 (see deploy/routerpi/README.md)
+# Auth:     "Authorization: Bearer <key>", key stored in /etc/sentinel/key
+# Override any setting below in /etc/sentinel/config
+
+. /usr/share/libubox/jshn.sh
+
+KEY_FILE=/etc/sentinel/key
+AT_PORT=/dev/ttyUSB2       # SIM7600 AT port. ttyUSB1 is its NMEA/GNSS port: never touched here
+I2C_BUS=1
+UPS_ADDR=0x43              # Waveshare UPS HAT (D) INA219
+SHUNT_MOHM=10              # 0.01 ohm shunt on Waveshare UPS HATs
+BATT_EMPTY_MV=3000
+BATT_FULL_MV=4200
+CURRENT_SIGN=1             # set to -1 if charging shows as negative current
+WWAN_IF=wwan0
+[ -f /etc/sentinel/config ] && . /etc/sentinel/config
+
+reply() {
+	echo "Status: $1"
+	echo "Content-Type: application/json"
+	echo "Cache-Control: no-store"
+	echo
+}
+
+want="$(cat "$KEY_FILE" 2>/dev/null)"
+if [ -z "$want" ] || [ "$HTTP_AUTHORIZATION" != "Bearer $want" ]; then
+	reply "401 Unauthorized"
+	echo '{"error":"unauthorized"}'
+	exit 0
+fi
+
+# ---------- system ----------
+cpu_sample() { awk '/^cpu /{printf "%d %d\n", $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat; }
+set -- $(cpu_sample); t1=$1; i1=$2
+sleep 1
+set -- $(cpu_sample); t2=$1; i2=$2
+dt=$((t2 - t1))
+cpu_pct=0
+[ "$dt" -gt 0 ] && cpu_pct=$(( 100 * (dt - (i2 - i1)) / dt ))
+
+mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+set -- $(cat /proc/loadavg)
+load1=$1; load5=$2; load15=$3
+uptime_s=$(cut -d. -f1 /proc/uptime)
+temp_c=$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+set -- $(df -k /overlay 2>/dev/null | awk 'NR==2{print $2, $3, $4}')
+disk_total=$1; disk_used=$2; disk_free=$3
+
+# Pi firmware under-voltage flag (rpi_volt hwmon), useful alongside the UPS readings
+undervolt=""
+for h in /sys/class/hwmon/hwmon*; do
+	[ "$(cat "$h/name" 2>/dev/null)" = "rpi_volt" ] && undervolt=$(cat "$h/in0_lcrit_alarm" 2>/dev/null)
+done
+
+json_init
+json_add_int timestamp "$(date +%s)"
+json_add_string hostname "$(cat /proc/sys/kernel/hostname)"
+
+json_add_object system
+json_add_int cpu_usage_pct "$cpu_pct"
+json_add_string load_avg "$load1 $load5 $load15"
+json_add_int cpu_cores "$(grep -c ^processor /proc/cpuinfo)"
+json_add_int mem_total_kb "${mem_total:-0}"
+json_add_int mem_available_kb "${mem_avail:-0}"
+[ -n "$mem_total" ] && [ -n "$mem_avail" ] && json_add_int mem_used_pct $(( 100 * (mem_total - mem_avail) / mem_total ))
+[ -n "$temp_c" ] && json_add_double cpu_temp_c "$temp_c"
+json_add_int uptime_s "$uptime_s"
+[ -n "$disk_total" ] && {
+	json_add_int overlay_total_kb "$disk_total"
+	json_add_int overlay_used_kb "$disk_used"
+	json_add_int overlay_free_kb "$disk_free"
+}
+[ -n "$undervolt" ] && json_add_boolean pi_undervoltage "$undervolt"
+json_close_object
+
+# ---------- UPS HAT (D): INA219, read-only (no config writes) ----------
+# SMBus words are little-endian, INA219 registers are big-endian: swap bytes
+ina_word() {
+	v=$(i2cget -y "$I2C_BUS" "$UPS_ADDR" "$1" w 2>/dev/null) || return 1
+	v=$((v))
+	echo $(( ((v & 0xff) << 8) | (v >> 8) ))
+}
+
+json_add_object battery
+if ! command -v i2cget >/dev/null; then
+	json_add_string error "i2c-tools not installed"
+elif bus=$(ina_word 0x02) && shunt=$(ina_word 0x01); then
+	mv=$(( (bus >> 3) * 4 ))                 # bus voltage, 4 mV per bit
+	[ "$shunt" -gt 32767 ] && shunt=$(( shunt - 65536 ))
+	ma=$(( CURRENT_SIGN * shunt * 10 / SHUNT_MOHM ))   # shunt LSB is 10 uV
+	pct=$(( (mv - BATT_EMPTY_MV) * 100 / (BATT_FULL_MV - BATT_EMPTY_MV) ))
+	[ "$pct" -lt 0 ] && pct=0
+	[ "$pct" -gt 100 ] && pct=100
+	state=idle
+	[ "$ma" -gt 50 ] && state=charging
+	[ "$ma" -lt -50 ] && state=discharging
+	json_add_double voltage_v "$(awk -v v="$mv" 'BEGIN{printf "%.3f", v/1000}')"
+	json_add_int current_ma "$ma"
+	json_add_int power_mw $(( mv * (ma < 0 ? -ma : ma) / 1000 ))
+	json_add_int percent "$pct"
+	json_add_string state "$state"
+else
+	json_add_string error "no response from INA219 at $UPS_ADDR on i2c-$I2C_BUS"
+fi
+json_close_object
+
+# ---------- LTE: SIM7600 via AT, query commands only ----------
+# Lock so concurrent requests never interleave on the AT port
+at() { timeout 5 sms-tool -d "$AT_PORT" at "$1" 2>/dev/null | tr -d '\r' | grep "^+"; }
+is_int() { case "$1" in ''|-|*[!0-9-]*) return 1 ;; esac; }
+add_tenths() { is_int "$2" && json_add_double "$1" "$(awk -v v="$2" 'BEGIN{printf "%.1f", v/10}')"; }
+
+json_add_object lte
+if ! command -v sms-tool >/dev/null; then
+	json_add_string error "sms-tool not installed"
+elif [ ! -c "$AT_PORT" ]; then
+	json_add_string error "AT port $AT_PORT not found"
+else
+	exec 9>/var/lock/sentinel-at.lock
+	if flock -w 8 9; then
+		csq=$(at "AT+CSQ")
+		cpsi=$(at "AT+CPSI?")
+		cops=$(at "AT+COPS?")
+		cgps=$(at "AT+CGPS?")
+		flock -u 9
+	fi
+
+	# +CSQ: <rssi>,<ber>  -> dBm = -113 + 2*rssi (99 = unknown)
+	n=$(echo "$csq" | sed -n 's/^+CSQ: *\([0-9]*\),.*/\1/p')
+	[ -n "$n" ] && [ "$n" != 99 ] && json_add_int csq_rssi_dbm $(( -113 + 2 * n ))
+
+	# +COPS: <mode>,<format>,"<operator>",<act>
+	op=$(echo "$cops" | sed -n 's/.*"\(.*\)".*/\1/p')
+	[ -n "$op" ] && json_add_string operator "$op"
+
+	# +CPSI: LTE,Online,MCC-MNC,TAC,CellID,PCI,Band,EARFCN,DLBW,ULBW,RSRQ,RSRP,RSSI,RSSNR
+	# RSRQ/RSRP/RSSI are in tenths of dB/dBm
+	line=$(echo "$cpsi" | sed -n 's/^+CPSI: *//p')
+	json_add_string cpsi_raw "$line"
+	mode=${line%%,*}
+	json_add_string network_mode "${mode:-unknown}"
+	if [ "$mode" = "LTE" ]; then
+		IFS=, read -r _ status plmn tac cell pci band earfcn dlbw ulbw rsrq rsrp rssi sinr <<-EOF
+		$line
+		EOF
+		json_add_string status "$status"
+		json_add_string plmn "$plmn"
+		json_add_string cell_id "$cell"
+		is_int "$pci" && json_add_int pci "$pci"
+		json_add_string band "${band#EUTRAN-}"
+		is_int "$earfcn" && json_add_int earfcn "$earfcn"
+		add_tenths rsrp_dbm "$rsrp"
+		add_tenths rsrq_db "$rsrq"
+		add_tenths rssi_dbm "$rssi"
+		is_int "$sinr" && json_add_int sinr_db "$sinr"
+	fi
+
+	# Report the modem's built-in GNSS state; it should stay off so the separate GPS module owns positioning
+	g=$(echo "$cgps" | sed -n 's/^+CGPS: *\([0-9]\).*/\1/p')
+	[ -n "$g" ] && json_add_string modem_gnss "$([ "$g" = 1 ] && echo on || echo off)"
+fi
+json_close_object
+
+# ---------- WWAN interface ----------
+json_add_object wwan
+json_add_string interface "$WWAN_IF"
+if [ -d "/sys/class/net/$WWAN_IF" ]; then
+	json_add_string operstate "$(cat /sys/class/net/$WWAN_IF/operstate)"
+	json_add_string ipv4 "$(ip -4 -o addr show "$WWAN_IF" 2>/dev/null | awk '{print $4; exit}')"
+	json_add_string rx_bytes "$(cat /sys/class/net/$WWAN_IF/statistics/rx_bytes)"
+	json_add_string tx_bytes "$(cat /sys/class/net/$WWAN_IF/statistics/tx_bytes)"
+else
+	json_add_string error "interface not found"
+fi
+json_close_object
+
+reply "200 OK"
+json_dump
