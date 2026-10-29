@@ -1,2 +1,5 @@
 # Runtime logs
 logs/*.log
+
+# Wrangler local cache (holds account details)
+.wrangler/
