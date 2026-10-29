@@ -1,0 +1,22 @@
+[Unit]
+Description=Sentinel read-only health endpoint (for cloudflared)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/sentinel/sentinel-health.py
+Environment="SENTINEL_SERVICES=ssh.socket cloudflared"
+LoadCredential=key:/etc/sentinel/key
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

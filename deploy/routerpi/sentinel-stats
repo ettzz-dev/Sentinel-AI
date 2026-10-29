@@ -1,14 +1,20 @@
 #!/bin/sh
-# Sentinel RouterPi stats: read-only JSON snapshot for the Sentinel MCP Worker.
+# Sentinel stats: read-only JSON views of an OpenWrt box for the Sentinel MCP Worker.
+# Runs on RouterPi (car) and the EdgeRouter X.
 #
-# Install on the Pi as /www/cgi-bin/sentinel-stats (chmod 755).
-# Requires: i2c-tools, sms-tool, kmod-i2c-bcm2835 (see deploy/routerpi/README.md)
-# Auth:     "Authorization: Bearer <key>", key stored in /etc/sentinel/key
+# Install as /www/cgi-bin/sentinel-stats (chmod 755).
+# RouterPi requires: i2c-tools, sms-tool, kmod-i2c-bcm2835 (see deploy/routerpi/README.md)
+# Auth:   "Authorization: Bearer <key>", key stored in /etc/sentinel/key
+# Views:  ?view=status (default) | network | clients | logs&lines=N&filter=TEXT
+#         | history&hours=N | usage
+# Cron:   "sentinel-stats --sample" appends one row to HISTORY_FILE (RouterPi, every 5 minutes)
 # Override any setting below in /etc/sentinel/config
 
 . /usr/share/libubox/jshn.sh
 
 KEY_FILE=/etc/sentinel/key
+UPS=1                      # 0 on boxes without the UPS HAT (D)
+LTE=1                      # 0 on boxes without the SIM7600
 AT_PORT=/dev/ttyUSB2       # SIM7600 AT port. ttyUSB1 is its NMEA/GNSS port: never touched here
 I2C_BUS=1
 UPS_ADDR=0x43              # Waveshare UPS HAT (D) INA219
@@ -16,7 +22,18 @@ SHUNT_MOHM=10              # 0.01 ohm shunt on Waveshare UPS HATs
 BATT_EMPTY_MV=3000
 BATT_FULL_MV=4200
 CURRENT_SIGN=1             # set to -1 if charging shows as negative current
-WWAN_IF=wwan0
+WWAN_IF=wwan0              # uplink device: traffic, ping and data usage are measured here
+HISTORY_FILE=/etc/sentinel/history.csv
+HISTORY_DAYS=35            # covers a full billing cycle
+PING_HOST=1.1.1.1
+NTP_MARK=/var/run/sentinel-ntp-ok   # touched by /etc/hotplug.d/ntp/90-sentinel once the clock is synced
+BALANCE_USSD=              # USSD code that replies with the data balance directly; empty = off
+BALANCE_CACHE_S=1800       # send the USSD at most this often
+ANYTIME_GB=60              # Vodacom contract: anytime and night bundles
+NIGHT_GB=40
+NIGHT_START=0              # night bundle window in local hours: [start, end)
+NIGHT_END=5
+BILL_DAY=1                 # first day of the billing cycle
 [ -f /etc/sentinel/config ] && . /etc/sentinel/config
 
 reply() {
@@ -26,59 +43,51 @@ reply() {
 	echo
 }
 
-want="$(cat "$KEY_FILE" 2>/dev/null)"
-if [ -z "$want" ] || [ "$HTTP_AUTHORIZATION" != "Bearer $want" ]; then
-	reply "401 Unauthorized"
-	echo '{"error":"unauthorized"}'
-	exit 0
-fi
+is_int() { case "$1" in ''|-|*[!0-9-]*) return 1 ;; esac; }
+tenths() { is_int "$1" && awk -v v="$1" 'BEGIN{printf "%.1f", v/10}'; }
+local_time() { date -d "@$1" '+%Y-%m-%d %H:%M'; }
+now=$(date +%s)
+hostname=$(cat /proc/sys/kernel/hostname)
 
-# ---------- system ----------
-cpu_sample() { awk '/^cpu /{printf "%d %d\n", $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat; }
-set -- $(cpu_sample); t1=$1; i1=$2
-sleep 1
-set -- $(cpu_sample); t2=$1; i2=$2
-dt=$((t2 - t1))
-cpu_pct=0
-[ "$dt" -gt 0 ] && cpu_pct=$(( 100 * (dt - (i2 - i1)) / dt ))
-
-mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
-mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
-set -- $(cat /proc/loadavg)
-load1=$1; load5=$2; load15=$3
-uptime_s=$(cut -d. -f1 /proc/uptime)
-temp_c=$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
-set -- $(df -k /overlay 2>/dev/null | awk 'NR==2{print $2, $3, $4}')
-disk_total=$1; disk_used=$2; disk_free=$3
-
-# Pi firmware under-voltage flag (rpi_volt hwmon), useful alongside the UPS readings
-undervolt=""
-for h in /sys/class/hwmon/hwmon*; do
-	[ "$(cat "$h/name" 2>/dev/null)" = "rpi_volt" ] && undervolt=$(cat "$h/in0_lcrit_alarm" 2>/dev/null)
-done
-
-json_init
-json_add_int timestamp "$(date +%s)"
-json_add_string hostname "$(cat /proc/sys/kernel/hostname)"
-
-json_add_object system
-json_add_int cpu_usage_pct "$cpu_pct"
-json_add_string load_avg "$load1 $load5 $load15"
-json_add_int cpu_cores "$(grep -c ^processor /proc/cpuinfo)"
-json_add_int mem_total_kb "${mem_total:-0}"
-json_add_int mem_available_kb "${mem_avail:-0}"
-[ -n "$mem_total" ] && [ -n "$mem_avail" ] && json_add_int mem_used_pct $(( 100 * (mem_total - mem_avail) / mem_total ))
-[ -n "$temp_c" ] && json_add_double cpu_temp_c "$temp_c"
-json_add_int uptime_s "$uptime_s"
-[ -n "$disk_total" ] && {
-	json_add_int overlay_total_kb "$disk_total"
-	json_add_int overlay_used_kb "$disk_used"
-	json_add_int overlay_free_kb "$disk_free"
+json_start() {
+	json_init
+	json_add_int timestamp "$now"
+	json_add_string time_local "$(local_time "$now")"
+	json_add_string hostname "$hostname"
 }
-[ -n "$undervolt" ] && json_add_boolean pi_undervoltage "$undervolt"
-json_close_object
 
-# ---------- UPS HAT (D): INA219, read-only (no config writes) ----------
+# ---------- readers: set shell variables, print nothing ----------
+
+read_basic() {
+	uptime_s=$(cut -d. -f1 /proc/uptime)
+	boot_id=$(cut -c1-8 /proc/sys/kernel/random/boot_id)
+	temp_c=$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+	# Pi firmware under-voltage flag (rpi_volt hwmon), useful alongside the UPS readings
+	undervolt=""
+	for h in /sys/class/hwmon/hwmon*; do
+		[ "$(cat "$h/name" 2>/dev/null)" = "rpi_volt" ] && undervolt=$(cat "$h/in0_lcrit_alarm" 2>/dev/null)
+	done
+}
+
+cpu_sample() { awk '/^cpu /{printf "%d %d\n", $2+$3+$4+$5+$6+$7+$8+$9, $5+$6}' /proc/stat; }
+
+read_system() {
+	set -- $(cpu_sample); t1=$1; i1=$2
+	sleep 1
+	set -- $(cpu_sample); t2=$1; i2=$2
+	dt=$((t2 - t1))
+	cpu_pct=0
+	[ "$dt" -gt 0 ] && cpu_pct=$(( 100 * (dt - (i2 - i1)) / dt ))
+
+	mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+	mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+	set -- $(cat /proc/loadavg)
+	load1=$1; load5=$2; load15=$3
+	set -- $(df -k /overlay 2>/dev/null | awk 'NR==2{print $2, $3, $4}')
+	disk_total=$1; disk_used=$2; disk_free=$3
+}
+
+# UPS HAT (D): INA219, read-only (no config writes)
 # SMBus words are little-endian, INA219 registers are big-endian: swap bytes
 ina_word() {
 	v=$(i2cget -y "$I2C_BUS" "$UPS_ADDR" "$1" w 2>/dev/null) || return 1
@@ -86,10 +95,16 @@ ina_word() {
 	echo $(( ((v & 0xff) << 8) | (v >> 8) ))
 }
 
-json_add_object battery
-if ! command -v i2cget >/dev/null; then
-	json_add_string error "i2c-tools not installed"
-elif bus=$(ina_word 0x02) && shunt=$(ina_word 0x01); then
+read_battery() {
+	batt_err= mv= ma= pct= state=
+	if ! command -v i2cget >/dev/null; then
+		batt_err="i2c-tools not installed"
+		return
+	fi
+	if ! bus=$(ina_word 0x02) || ! shunt=$(ina_word 0x01); then
+		batt_err="no response from INA219 at $UPS_ADDR on i2c-$I2C_BUS"
+		return
+	fi
 	mv=$(( (bus >> 3) * 4 ))                 # bus voltage, 4 mV per bit
 	[ "$shunt" -gt 32767 ] && shunt=$(( shunt - 65536 ))
 	ma=$(( CURRENT_SIGN * shunt * 10 / SHUNT_MOHM ))   # shunt LSB is 10 uV
@@ -99,28 +114,22 @@ elif bus=$(ina_word 0x02) && shunt=$(ina_word 0x01); then
 	state=idle
 	[ "$ma" -gt 50 ] && state=charging
 	[ "$ma" -lt -50 ] && state=discharging
-	json_add_double voltage_v "$(awk -v v="$mv" 'BEGIN{printf "%.3f", v/1000}')"
-	json_add_int current_ma "$ma"
-	json_add_int power_mw $(( mv * (ma < 0 ? -ma : ma) / 1000 ))
-	json_add_int percent "$pct"
-	json_add_string state "$state"
-else
-	json_add_string error "no response from INA219 at $UPS_ADDR on i2c-$I2C_BUS"
-fi
-json_close_object
+}
 
-# ---------- LTE: SIM7600 via AT, query commands only ----------
-# Lock so concurrent requests never interleave on the AT port
+# SIM7600 via AT, query commands only.
+# Lock so concurrent requests (and the cron sampler) never interleave on the AT port
 at() { timeout 5 sms-tool -d "$AT_PORT" at "$1" 2>/dev/null | tr -d '\r' | grep "^+"; }
-is_int() { case "$1" in ''|-|*[!0-9-]*) return 1 ;; esac; }
-add_tenths() { is_int "$2" && json_add_double "$1" "$(awk -v v="$2" 'BEGIN{printf "%.1f", v/10}')"; }
 
-json_add_object lte
-if ! command -v sms-tool >/dev/null; then
-	json_add_string error "sms-tool not installed"
-elif [ ! -c "$AT_PORT" ]; then
-	json_add_string error "AT port $AT_PORT not found"
-else
+read_lte() {
+	lte_err= csq_dbm= op= line= mode= status= plmn= cell= pci= band= earfcn= rsrp= rsrq= rssi= sinr= gnss=
+	if ! command -v sms-tool >/dev/null; then
+		lte_err="sms-tool not installed"
+		return
+	fi
+	if [ ! -c "$AT_PORT" ]; then
+		lte_err="AT port $AT_PORT not found"
+		return
+	fi
 	exec 9>/var/lock/sentinel-at.lock
 	if flock -w 8 9; then
 		csq=$(at "AT+CSQ")
@@ -132,52 +141,542 @@ else
 
 	# +CSQ: <rssi>,<ber>  -> dBm = -113 + 2*rssi (99 = unknown)
 	n=$(echo "$csq" | sed -n 's/^+CSQ: *\([0-9]*\),.*/\1/p')
-	[ -n "$n" ] && [ "$n" != 99 ] && json_add_int csq_rssi_dbm $(( -113 + 2 * n ))
+	[ -n "$n" ] && [ "$n" != 99 ] && csq_dbm=$(( -113 + 2 * n ))
 
 	# +COPS: <mode>,<format>,"<operator>",<act>
 	op=$(echo "$cops" | sed -n 's/.*"\(.*\)".*/\1/p')
-	[ -n "$op" ] && json_add_string operator "$op"
 
 	# +CPSI: LTE,Online,MCC-MNC,TAC,CellID,PCI,Band,EARFCN,DLBW,ULBW,RSRQ,RSRP,RSSI,RSSNR
 	# RSRQ/RSRP/RSSI are in tenths of dB/dBm
 	line=$(echo "$cpsi" | sed -n 's/^+CPSI: *//p')
-	json_add_string cpsi_raw "$line"
 	mode=${line%%,*}
-	json_add_string network_mode "${mode:-unknown}"
 	if [ "$mode" = "LTE" ]; then
 		IFS=, read -r _ status plmn tac cell pci band earfcn dlbw ulbw rsrq rsrp rssi sinr <<-EOF
 		$line
 		EOF
-		json_add_string status "$status"
-		json_add_string plmn "$plmn"
-		json_add_string cell_id "$cell"
-		is_int "$pci" && json_add_int pci "$pci"
-		json_add_string band "${band#EUTRAN-}"
-		is_int "$earfcn" && json_add_int earfcn "$earfcn"
-		add_tenths rsrp_dbm "$rsrp"
-		add_tenths rsrq_db "$rsrq"
-		add_tenths rssi_dbm "$rssi"
-		is_int "$sinr" && json_add_int sinr_db "$sinr"
+		band=${band#EUTRAN-}
+		rsrp=$(tenths "$rsrp")
+		rsrq=$(tenths "$rsrq")
+		rssi=$(tenths "$rssi")
+		is_int "$sinr" || sinr=
 	fi
 
-	# Report the modem's built-in GNSS state; it should stay off so the separate GPS module owns positioning
+	# The modem's built-in GNSS should stay off so the separate GPS module owns positioning
 	g=$(echo "$cgps" | sed -n 's/^+CGPS: *\([0-9]\).*/\1/p')
-	[ -n "$g" ] && json_add_string modem_gnss "$([ "$g" = 1 ] && echo on || echo off)"
-fi
-json_close_object
+	[ -n "$g" ] && gnss=$([ "$g" = 1 ] && echo on || echo off)
+}
 
-# ---------- WWAN interface ----------
-json_add_object wwan
-json_add_string interface "$WWAN_IF"
-if [ -d "/sys/class/net/$WWAN_IF" ]; then
-	json_add_string operstate "$(cat /sys/class/net/$WWAN_IF/operstate)"
-	json_add_string ipv4 "$(ip -4 -o addr show "$WWAN_IF" 2>/dev/null | awk '{print $4; exit}')"
-	json_add_string rx_bytes "$(cat /sys/class/net/$WWAN_IF/statistics/rx_bytes)"
-	json_add_string tx_bytes "$(cat /sys/class/net/$WWAN_IF/statistics/tx_bytes)"
-else
-	json_add_string error "interface not found"
-fi
-json_close_object
+read_wwan() {
+	wwan_state= wwan_ip= rx= tx=
+	[ -d "/sys/class/net/$WWAN_IF" ] || return
+	wwan_state=$(cat "/sys/class/net/$WWAN_IF/operstate")
+	wwan_ip=$(ip -4 -o addr show "$WWAN_IF" 2>/dev/null | awk '{print $4; exit}')
+	rx=$(cat "/sys/class/net/$WWAN_IF/statistics/rx_bytes")
+	tx=$(cat "/sys/class/net/$WWAN_IF/statistics/tx_bytes")
+}
 
-reply "200 OK"
-json_dump
+# ---------- view=status ----------
+
+view_status() {
+	read_basic
+	read_system
+	json_start
+
+	json_add_object system
+	json_add_int cpu_usage_pct "$cpu_pct"
+	json_add_string load_avg "$load1 $load5 $load15"
+	json_add_int cpu_cores "$(grep -c ^processor /proc/cpuinfo)"
+	json_add_int mem_total_kb "${mem_total:-0}"
+	json_add_int mem_available_kb "${mem_avail:-0}"
+	[ -n "$mem_total" ] && [ -n "$mem_avail" ] && json_add_int mem_used_pct $(( 100 * (mem_total - mem_avail) / mem_total ))
+	[ -n "$temp_c" ] && json_add_double cpu_temp_c "$temp_c"
+	json_add_int uptime_s "$uptime_s"
+	[ -n "$disk_total" ] && {
+		json_add_int overlay_total_kb "$disk_total"
+		json_add_int overlay_used_kb "$disk_used"
+		json_add_int overlay_free_kb "$disk_free"
+	}
+	[ -n "$undervolt" ] && json_add_boolean pi_undervoltage "$undervolt"
+	json_close_object
+
+	if [ "$UPS" = 1 ]; then
+		read_battery
+		json_add_object battery
+		if [ -n "$batt_err" ]; then
+			json_add_string error "$batt_err"
+		else
+			json_add_double voltage_v "$(awk -v v="$mv" 'BEGIN{printf "%.3f", v/1000}')"
+			json_add_int current_ma "$ma"
+			json_add_int power_mw $(( mv * (ma < 0 ? -ma : ma) / 1000 ))
+			json_add_int percent "$pct"
+			json_add_string state "$state"
+		fi
+		json_close_object
+	fi
+
+	if [ "$LTE" = 1 ]; then
+		read_lte
+		json_add_object lte
+		if [ -n "$lte_err" ]; then
+			json_add_string error "$lte_err"
+		else
+			[ -n "$csq_dbm" ] && json_add_int csq_rssi_dbm "$csq_dbm"
+			[ -n "$op" ] && json_add_string operator "$op"
+			json_add_string cpsi_raw "$line"
+			json_add_string network_mode "${mode:-unknown}"
+			if [ "$mode" = "LTE" ]; then
+				json_add_string status "$status"
+				json_add_string plmn "$plmn"
+				json_add_string cell_id "$cell"
+				is_int "$pci" && json_add_int pci "$pci"
+				json_add_string band "$band"
+				is_int "$earfcn" && json_add_int earfcn "$earfcn"
+				[ -n "$rsrp" ] && json_add_double rsrp_dbm "$rsrp"
+				[ -n "$rsrq" ] && json_add_double rsrq_db "$rsrq"
+				[ -n "$rssi" ] && json_add_double rssi_dbm "$rssi"
+				[ -n "$sinr" ] && json_add_int sinr_db "$sinr"
+			fi
+			[ -n "$gnss" ] && json_add_string modem_gnss "$gnss"
+		fi
+		json_close_object
+	fi
+
+	read_wwan
+	json_add_object wwan
+	json_add_string interface "$WWAN_IF"
+	if [ -n "$wwan_state" ]; then
+		json_add_string operstate "$wwan_state"
+		json_add_string ipv4 "$wwan_ip"
+		json_add_string rx_bytes "$rx"
+		json_add_string tx_bytes "$tx"
+	else
+		json_add_string error "interface not found"
+	fi
+	json_close_object
+
+	reply "200 OK"
+	json_dump
+}
+
+# ---------- view=network ----------
+
+net_snap() {
+	for d in /sys/class/net/*; do
+		n=${d##*/}
+		[ "$n" = lo ] && continue
+		echo "$n $(cat "$d/statistics/rx_bytes") $(cat "$d/statistics/tx_bytes")"
+	done
+}
+
+iface_field() { echo "$dump" | jsonfilter -e "@.interface[@.interface='$name']$1" 2>/dev/null | head -n 1; }
+
+view_network() {
+	json_start
+
+	# Logical interfaces (wan, lan, wwan...)
+	dump=$(ubus call network.interface dump 2>/dev/null)
+	json_add_array interfaces
+	for name in $(echo "$dump" | jsonfilter -e '@.interface[*].interface' 2>/dev/null); do
+		[ "$name" = loopback ] && continue
+		json_add_object ""
+		json_add_string name "$name"
+		json_add_boolean up "$([ "$(iface_field .up)" = true ] && echo 1 || echo 0)"
+		json_add_string proto "$(iface_field .proto)"
+		json_add_string device "$(iface_field .l3_device)"
+		upt=$(iface_field .uptime)
+		is_int "$upt" && json_add_int uptime_s "$upt"
+		ip4=$(iface_field '["ipv4-address"][0].address')
+		[ -n "$ip4" ] && json_add_string ipv4 "$ip4/$(iface_field '["ipv4-address"][0].mask')"
+		gw=$(iface_field ".route[@.target='0.0.0.0'].nexthop")
+		[ -n "$gw" ] && json_add_string gateway "$gw"
+		dns=$(echo "$dump" | jsonfilter -e "@.interface[@.interface='$name']['dns-server'][*]" 2>/dev/null | tr '\n' ' ')
+		[ -n "$dns" ] && json_add_string dns "${dns% }"
+		json_close_object
+	done
+	json_close_array
+
+	# Physical/virtual devices with a 1-second traffic rate
+	s1=$(net_snap)
+	sleep 1
+	s2=$(net_snap)
+	json_add_array devices
+	while read -r n rx tx; do
+		[ -n "$n" ] || continue
+		prev=$(echo "$s1" | awk -v n="$n" '$1==n{print $2, $3}')
+		json_add_object ""
+		json_add_string name "$n"
+		json_add_string operstate "$(cat "/sys/class/net/$n/operstate" 2>/dev/null)"
+		speed=$(cat "/sys/class/net/$n/speed" 2>/dev/null)
+		is_int "$speed" && [ "$speed" -gt 0 ] && json_add_int link_mbps "$speed"
+		json_add_string rx_bytes "$rx"
+		json_add_string tx_bytes "$tx"
+		if [ -n "$prev" ]; then
+			json_add_int rx_bps $(( (rx - ${prev% *}) * 8 ))
+			json_add_int tx_bps $(( (tx - ${prev#* }) * 8 ))
+		fi
+		json_close_object
+	done <<-EOF
+	$s2
+	EOF
+	json_close_array
+
+	json_add_string default_route "$(ip -4 route show default 2>/dev/null | head -n 1)"
+	json_add_array routes_v4
+	while IFS= read -r r; do
+		[ -n "$r" ] && json_add_string "" "$r"
+	done <<-EOF
+	$(ip -4 route show 2>/dev/null | head -n 40)
+	EOF
+	json_close_array
+	json_add_string default_route_v6 "$(ip -6 route show default 2>/dev/null | head -n 1)"
+
+	reply "200 OK"
+	json_dump
+}
+
+# ---------- view=clients ----------
+
+add_lease() {   # expiry_epoch mac ip hostname
+	json_add_object ""
+	json_add_string ip "$3"
+	json_add_string mac "$2"
+	[ -n "$4" ] && [ "$4" != "*" ] && json_add_string hostname "$4"
+	if is_int "$1" && [ "$1" -gt 0 ]; then
+		json_add_int lease_expires_in_s $(( $1 - now ))
+	else
+		json_add_string lease "static"
+	fi
+	st=$(echo "$neigh" | awk -v ip="$3" '$1==ip{print $NF; exit}')
+	json_add_string arp_state "${st:-none}"
+	json_close_object
+}
+
+view_clients() {
+	json_start
+	neigh=$(ip -4 neigh show 2>/dev/null)
+
+	json_add_array dhcp_leases
+	if [ -s /tmp/dhcp.leases ]; then
+		# dnsmasq: <expiry> <mac> <ip> <hostname> <client-id>
+		while read -r exp mac ip host _; do
+			[ -n "$mac" ] && add_lease "$exp" "$mac" "$ip" "$host"
+		done < /tmp/dhcp.leases
+	else
+		# odhcpd or other servers: ask LuCI's rpc (expires is seconds remaining there)
+		leases=$(ubus call luci-rpc getDHCPLeases 2>/dev/null)
+		i=0
+		while mac=$(echo "$leases" | jsonfilter -e "@.dhcp_leases[$i].macaddr" 2>/dev/null) && [ -n "$mac" ]; do
+			exp=$(echo "$leases" | jsonfilter -e "@.dhcp_leases[$i].expires" 2>/dev/null)
+			is_int "$exp" && [ "$exp" -gt 0 ] && exp=$(( now + exp ))
+			add_lease "$exp" "$mac" \
+				"$(echo "$leases" | jsonfilter -e "@.dhcp_leases[$i].ipaddr" 2>/dev/null)" \
+				"$(echo "$leases" | jsonfilter -e "@.dhcp_leases[$i].hostname" 2>/dev/null)"
+			i=$((i + 1))
+		done
+	fi
+	json_close_array
+
+	# All IPv4 neighbours, including static-IP devices that never took a lease
+	json_add_array neighbours
+	while IFS= read -r r; do
+		case "$r" in *lladdr*) json_add_string "" "$r" ;; esac
+	done <<-EOF
+	$neigh
+	EOF
+	json_close_array
+
+	if command -v iwinfo >/dev/null; then
+		json_add_array wifi_stations
+		for w in $(iwinfo 2>/dev/null | awk '/ESSID/{print $1}'); do
+			while read -r mac sig _; do
+				json_add_object ""
+				json_add_string iface "$w"
+				json_add_string mac "$mac"
+				is_int "$sig" && json_add_int signal_dbm "$sig"
+				json_close_object
+			done <<-EOF
+			$(iwinfo "$w" assoclist 2>/dev/null | awk '/dBm/{print $1, $2}')
+			EOF
+		done
+		json_close_array
+	fi
+
+	reply "200 OK"
+	json_dump
+}
+
+# ---------- view=logs ----------
+
+view_logs() {
+	json_start
+	json_add_int lines "$lines"
+	[ -n "$filter" ] && json_add_string filter "$filter"
+	json_add_array log
+	while IFS= read -r l; do
+		[ -n "$l" ] && json_add_string "" "$l"
+	done <<-EOF
+	$(logread 2>/dev/null | if [ -n "$filter" ]; then grep -iF -- "$filter"; else cat; fi | tail -n "$lines" | cut -c 1-300)
+	EOF
+	json_close_array
+	reply "200 OK"
+	json_dump
+}
+
+# ---------- cron: --sample ----------
+# History columns:
+#  1 ts  2 local_time  3 boot_id  4 uptime_s  5 network_mode  6 lte_status  7 rsrp_dbm  8 rsrq_db
+#  9 sinr_db  10 band  11 operator  12 wwan_state  13 rx_bytes  14 tx_bytes  15 ping_ok
+#  16 battery_pct  17 battery_ma  18 undervoltage  19 cpu_temp_c  20 clock_synced
+
+sample() {
+	read_basic
+	[ "$UPS" = 1 ] && read_battery
+	[ "$LTE" = 1 ] && read_lte
+	read_wwan
+	ping_ok=0
+	ping -c 1 -W 3 -I "$WWAN_IF" "$PING_HOST" >/dev/null 2>&1 && ping_ok=1
+	# No RTC on the Pi: rows taken before NTP sync carry a guessed time
+	synced=0
+	[ -f "$NTP_MARK" ] && synced=1
+	opname=$(echo "$op" | tr -cd 'A-Za-z0-9 ._-')
+
+	mkdir -p "${HISTORY_FILE%/*}"
+	echo "$now,$(local_time "$now"),$boot_id,$uptime_s,$mode,$status,$rsrp,$rsrq,$sinr,$band,$opname,$wwan_state,$rx,$tx,$ping_ok,$pct,$ma,$undervolt,$temp_c,$synced" >> "$HISTORY_FILE"
+
+	# Trim once a day's worth of extra rows has built up, to limit flash writes
+	max=$(( HISTORY_DAYS * 288 ))
+	if [ "$(wc -l < "$HISTORY_FILE")" -gt $(( max + 288 )) ]; then
+		tail -n "$max" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+	fi
+}
+
+# ---------- view=history ----------
+
+view_history() {
+	if [ ! -s "$HISTORY_FILE" ]; then
+		reply "200 OK"
+		echo '{"error":"no history yet: is the sentinel-stats --sample cron job installed?"}'
+		return
+	fi
+	# At most 24 buckets so the answer stays small
+	bucket=3600
+	[ "$hours" -gt 24 ] && bucket=$(( (hours + 23) / 24 * 3600 ))
+	reply "200 OK"
+	awk -F, -v now="$now" -v hours="$hours" -v bs="$bucket" -v host="$hostname" '
+	function num(x) { return x == "" ? "null" : x + 0 }
+	BEGIN { start = now - hours * 3600; ne = 0 }
+	$1 >= start {
+		n++
+		if (first == "") first = $2
+		last = $2
+		if ($20 == "0") unsync++
+		b = int(($1 - start) / bs)
+		if (!(b in bn)) { bn[b] = 0; bfrom[b] = $2 }
+		bn[b]++
+		if ($7 != "") {
+			v = $7 + 0
+			bsum[b] += v; bcnt[b]++
+			if (!(b in bmin) || v < bmin[b]) bmin[b] = v
+			rsum += v; rcnt++
+			if (rcnt == 1 || v < rmin) rmin = v
+			if (rcnt == 1 || v > rmax) rmax = v
+		}
+		if ($9 != "") { ssum += $9; scnt++ }
+		if ($15 == "0") { boff[b]++; off++ }
+		if ($5 != "LTE" || $6 != "Online") { bnl[b]++; nolte++ }
+		if ($16 != "" && (!(b in bbat) || $16 + 0 < bbat[b])) bbat[b] = $16 + 0
+
+		if (pb != "" && $3 != pb) {
+			reboots++
+			ev[ne++] = sprintf("{\"type\":\"reboot\",\"first_sample_after\":\"%s\",\"uptime_s_then\":%d,\"last_sample_before\":\"%s\",\"before\":{\"network_mode\":\"%s\",\"rsrp_dbm\":%s,\"sinr_db\":%s,\"internet_ok\":%s,\"battery_pct\":%s,\"battery_ma\":%s,\"undervoltage\":%s}}", \
+				$2, $4, p2, p5, num(p7), num(p9), num(p15), num(p16), num(p17), num(p18))
+		} else if (pt != "" && $1 - pt > 900 && p20 != "0") {
+			ev[ne++] = sprintf("{\"type\":\"gap\",\"from\":\"%s\",\"to\":\"%s\",\"minutes\":%d}", p2, $2, ($1 - pt) / 60)
+		}
+		if (pp != "" && $3 == pb && $15 != pp) {
+			ev[ne++] = sprintf("{\"type\":\"%s\",\"at\":\"%s\",\"network_mode\":\"%s\",\"rsrp_dbm\":%s,\"sinr_db\":%s}", \
+				($15 == "1" ? "internet_up" : "internet_down"), $2, $5, num($7), num($9))
+		}
+	}
+	{ pb = $3; pt = $1; pp = $15; p2 = $2; p5 = $5; p7 = $7; p9 = $9; p16 = $16; p17 = $17; p18 = $18; p20 = $20; p15 = $15 }
+	END {
+		printf "{\"timestamp\":%d,\"hostname\":\"%s\",\"window_hours\":%d,\"bucket_minutes\":%d,", now, host, hours, bs / 60
+		printf "\"summary\":{\"samples\":%d,\"expected_samples\":%d,\"first_sample\":\"%s\",\"last_sample\":\"%s\",\"reboots\":%d,", n, hours * 12, first, last, reboots
+		printf "\"samples_internet_down\":%d,\"samples_not_lte_online\":%d,\"samples_clock_unsynced\":%d,", off, nolte, unsync
+		printf "\"rsrp_dbm\":{\"min\":%s,\"avg\":%s,\"max\":%s},\"sinr_db_avg\":%s},", \
+			(rcnt ? rmin : "null"), (rcnt ? sprintf("%.1f", rsum / rcnt) : "null"), (rcnt ? rmax : "null"), (scnt ? sprintf("%.1f", ssum / scnt) : "null")
+		printf "\"buckets\":["
+		sep = ""
+		for (b = 0; b * bs < hours * 3600; b++) {
+			if (!(b in bn)) continue
+			printf "%s{\"from\":\"%s\",\"samples\":%d,\"rsrp_avg\":%s,\"rsrp_min\":%s,\"internet_down\":%d,\"not_lte_online\":%d,\"battery_min_pct\":%s}", \
+				sep, bfrom[b], bn[b], (bcnt[b] ? sprintf("%.1f", bsum[b] / bcnt[b]) : "null"), ((b in bmin) ? bmin[b] : "null"), boff[b], bnl[b], ((b in bbat) ? bbat[b] : "null")
+			sep = ","
+		}
+		printf "],\"events\":["
+		sep = ""
+		for (i = (ne > 30 ? ne - 30 : 0); i < ne; i++) { printf "%s%s", sep, ev[i]; sep = "," }
+		printf "]"
+		if (ne > 30) printf ",\"older_events_omitted\":%d", ne - 30
+		printf "}\n"
+	}' "$HISTORY_FILE"
+}
+
+# ---------- view=usage ----------
+
+# Operator balance via USSD (fixed code from config, never caller input), cached
+balance() {
+	cache=/tmp/sentinel-balance
+	if [ -s "$cache" ] && [ $(( now - $(date -r "$cache" +%s) )) -lt "$BALANCE_CACHE_S" ]; then
+		bal_cached=1
+	else
+		bal_cached=0
+		exec 9>/var/lock/sentinel-at.lock
+		flock -w 8 9 || return
+		out=$(timeout 12 sms-tool -d "$AT_PORT" ussd "$BALANCE_USSD" 2>/dev/null | tr -d '\r')
+		flock -u 9
+		[ -n "$out" ] || return
+		printf '%s' "$out" > "$cache"
+	fi
+	bal_text=$(cat "$cache")
+	bal_time=$(local_time "$(date -r "$cache" +%s)")
+}
+
+view_usage() {
+	y=$(date +%Y); m=$(date +%m); d=$(date +%d)
+	m=${m#0}; d=${d#0}
+	if [ "$d" -lt "$BILL_DAY" ]; then
+		m=$((m - 1))
+		[ "$m" -eq 0 ] && { m=12; y=$((y - 1)); }
+	fi
+	cycle=$(printf '%04d-%02d-%02d' "$y" "$m" "$BILL_DAY")
+	week=$(date -d "@$(( now - 6 * 86400 ))" +%Y-%m-%d)
+
+	json_start
+	json_add_object contract
+	json_add_int anytime_gb "$ANYTIME_GB"
+	json_add_int night_gb "$NIGHT_GB"
+	json_add_string night_window "$(printf '%02d:00-%02d:00' "$NIGHT_START" "$NIGHT_END")"
+	json_add_string cycle_start "$cycle"
+	json_close_object
+
+	if [ -s "$HISTORY_FILE" ]; then
+		# Sum WWAN byte deltas between samples; a counter reset (reboot or interface restart)
+		# counts from zero. Each delta is booked to the hour of the sample that closes it.
+		counted=$(awk -F, -v cycle="$cycle" -v week="$week" -v ns="$NIGHT_START" -v nend="$NIGHT_END" '
+		$13 == "" { pb = ""; next }
+		{
+			tot = $13 + $14
+			if (pb == "") d = 0
+			else if ($3 == pb && tot >= pt) d = tot - pt
+			else d = tot
+			pb = $3; pt = tot
+			day = substr($2, 1, 10); h = substr($2, 12, 2) + 0
+			night = ns < nend ? (h >= ns && h < nend) : (h >= ns || h < nend)
+			if (day >= cycle) { if (since == "") since = day; if (night) cn += d; else ca += d }
+			if (day >= week) {
+				if (!(day in seen)) { seen[day] = 1; days[nd++] = day }
+				if (night) dn[day] += d; else da[day] += d
+			}
+		}
+		END {
+			g = 1073741824
+			printf "cycle %.2f %.2f %s\n", ca / g, cn / g, since
+			for (i = 0; i < nd; i++) printf "day %s %.2f %.2f\n", days[i], da[days[i]] / g, dn[days[i]] / g
+		}' "$HISTORY_FILE")
+
+		json_add_array last_7_days
+		while read -r kind a b c; do
+			case "$kind" in
+			cycle)
+				cyc_any=$a; cyc_night=$b; cyc_since=$c ;;
+			day)
+				json_add_object ""
+				json_add_string date "$a"
+				json_add_double anytime_gb "$b"
+				json_add_double night_gb "$c"
+				json_close_object ;;
+			esac
+		done <<-EOF
+		$counted
+		EOF
+		json_close_array
+
+		json_add_object this_cycle
+		json_add_double anytime_used_gb "$cyc_any"
+		json_add_double anytime_left_gb "$(awk -v t="$ANYTIME_GB" -v u="$cyc_any" 'BEGIN{printf "%.2f", t-u}')"
+		json_add_double night_used_gb "$cyc_night"
+		json_add_double night_left_gb "$(awk -v t="$NIGHT_GB" -v u="$cyc_night" 'BEGIN{printf "%.2f", t-u}')"
+		[ -n "$cyc_since" ] && json_add_string counted_since "$cyc_since"
+		json_close_object
+		json_add_string note "Counted from the Pi's $WWAN_IF byte counters (GiB). Estimates: the operator's figures win."
+	else
+		json_add_string counted_error "no history yet: is the sentinel-stats --sample cron job installed?"
+	fi
+
+	json_add_object operator_balance
+	if [ -z "$BALANCE_USSD" ]; then
+		json_add_string error "not configured (set BALANCE_USSD in /etc/sentinel/config)"
+	elif [ "$LTE" != 1 ] || [ ! -c "$AT_PORT" ]; then
+		json_add_string error "no modem"
+	else
+		balance
+		if [ -n "$bal_text" ]; then
+			json_add_string text "$bal_text"
+			json_add_string checked_at "$bal_time"
+			json_add_boolean cached "$bal_cached"
+		else
+			json_add_string error "no USSD reply (busy, no network, or USSD unsupported on LTE)"
+		fi
+	fi
+	json_close_object
+
+	reply "200 OK"
+	json_dump
+}
+
+# ---------- main ----------
+
+if [ "$1" = "--sample" ] && [ -z "$GATEWAY_INTERFACE" ]; then
+	sample
+	exit 0
+fi
+
+want="$(cat "$KEY_FILE" 2>/dev/null)"
+if [ -z "$want" ] || [ "$HTTP_AUTHORIZATION" != "Bearer $want" ]; then
+	reply "401 Unauthorized"
+	echo '{"error":"unauthorized"}'
+	exit 0
+fi
+
+view=status lines=40 hours=24 filter=
+set -f
+for kv in $(echo "$QUERY_STRING" | tr '&' ' '); do
+	v=${kv#*=}
+	case "$kv" in
+	view=*) view=$v ;;
+	lines=*) is_int "$v" && lines=$v ;;
+	hours=*) is_int "$v" && hours=$v ;;
+	filter=*)
+		# URL-decode, then keep a safe character set only
+		filter=$(printf '%b' "$(echo "$v" | sed 's/+/ /g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')" | tr -cd 'A-Za-z0-9 ._:/-' | cut -c 1-64) ;;
+	esac
+done
+set +f
+[ "$lines" -lt 1 ] && lines=1
+[ "$lines" -gt 100 ] && lines=100
+[ "$hours" -lt 1 ] && hours=1
+[ "$hours" -gt 840 ] && hours=840
+
+case "$view" in
+status) view_status ;;
+network) view_network ;;
+clients) view_clients ;;
+logs) view_logs ;;
+history) view_history ;;
+usage) view_usage ;;
+*)
+	reply "400 Bad Request"
+	echo '{"error":"unknown view"}'
+	;;
+esac

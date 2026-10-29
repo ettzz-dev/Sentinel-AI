@@ -224,14 +224,40 @@ try {
         }
     }
     if ($mcpTools) {
-        $mcpNote = "\n\nGATEWAY ACCESS: You have read-only access to the user's OpenWrt gateway through the tools whose names start with owrt_. "
-                 . 'Use them when the user asks about the gateway, network status, clients, interfaces, logs or connectivity, and base your answer on the real tool output. '
-                 . 'You cannot change anything on the gateway; never claim you did. Never reveal secrets that appear in tool output.';
+        $mcpNote = "\n\nINFRASTRUCTURE ACCESS: You have read-only access to the user's infrastructure (OpenWrt routers, Azure VPS) through the tools whose names start with owrt_. "
+                 . 'Use them when the user asks about network status, clients, interfaces, logs, connectivity or server health, and base your answer on the real tool output. '
+                 . 'You cannot change anything; never claim you did. Never reveal secrets that appear in tool output. '
+                 . 'The *-logs tools accept lines and filter (e.g. filter "cloudflared"); to diagnose, start filtered, and quote only the relevant lines.';
         if (isset($mcpMap['owrt_get-routerpi-status'])) {
             $mcpNote .= ' RouterPi is the OpenWrt Raspberry Pi in the car (UPS HAT battery, SIM7600 LTE modem, separate GPS module). '
                       . 'Use owrt_get-routerpi-status for its battery, LTE signal, CPU, memory, temperature or uptime. '
                       . 'LTE RSRP guide: >= -80 dBm excellent, -80 to -90 good, -90 to -100 fair, < -100 poor; SINR > 20 dB excellent, 13-20 good, 0-13 fair, < 0 poor. '
                       . 'If the tool fails, say the car may be off or out of coverage rather than guessing values.';
+        }
+        if (isset($mcpMap['owrt_get-routerpi-history'])) {
+            $mcpNote .= ' owrt_get-routerpi-history is recorded on the Pi every 5 minutes, so it covers times the tunnel was down. '
+                      . 'Use it for questions about the past or for patterns: compare the "before" readings of reboot events and the signal at internet_down events. '
+                      . 'A gap between samples with no reboot usually means the Pi was off (car off, battery flat). '
+                      . 'Samples taken before the clock synced (samples_clock_unsynced) may have wrong times.';
+        }
+        if (isset($mcpMap['owrt_get-routerpi-data-usage'])) {
+            $mcpNote .= ' RouterPi\'s Vodacom contract is 60 GB anytime plus 40 GB night data per billing cycle. '
+                      . 'owrt_get-routerpi-data-usage counts usage from the Pi\'s own byte counters: present those as estimates. '
+                      . 'When operator_balance.text is present, it is Vodacom\'s own figure and takes precedence.';
+        }
+        if (isset($mcpMap['owrt_get-erx-status'])) {
+            $mcpNote .= ' The EdgeRouter X is an OpenWrt router; its owrt_get-erx-* tools mirror the RouterPi ones (no battery or LTE). '
+                      . 'If an ERX tool fails with the tunnel offline, the router or its internet connection may be down.';
+        }
+        if (isset($mcpMap['owrt_get-azure-vps-health'])) {
+            $mcpNote .= ' owrt_get-azure-vps-health reports the Azure Ubuntu 24.04 VPS. Ports with scope "all interfaces" are only reachable from the internet '
+                      . 'if the Azure network security group allows them, so do not call them exposed without that caveat. Flag failed units, disks above 85% and pending security updates.';
+        }
+        if (preg_grep('/^owrt_phone-/', array_keys($mcpMap))) {
+            $mcpNote .= "\n\nPHONE ACCESS: Tools starting with owrt_phone- read the user's Samsung Galaxy phone (contacts, files, location, sensors and whatever else is enabled in its Phone MCP app). "
+                      . 'Use them only when the user asks about their phone or the answer needs it. Contacts, messages, files and location are private: '
+                      . 'quote only what the question needs, and never save phone numbers, addresses or precise locations with the remember tool. '
+                      . 'If a phone tool fails, say the phone may be asleep, offline or the tunnel in Termux stopped, rather than guessing.';
         }
     }
 

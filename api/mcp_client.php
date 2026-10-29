@@ -190,7 +190,7 @@ class McpClient
         if ($text === '' && isset($res['structuredContent'])) $text = json_encode($res['structuredContent']);
         if ($text === '') $text = json_encode($res);
         $text = trim($text);
-        if (strlen($text) > 8000) $text = substr($text, 0, 8000) . "\n...[truncated]";
+        if (strlen($text) > 12000) $text = substr($text, 0, 12000) . "\n...[truncated]";
         return ['ok' => empty($res['isError']), 'text' => $text];
     }
 
@@ -202,6 +202,8 @@ class McpClient
         }
         $spaced = preg_replace('/([a-z0-9])([A-Z])/', '$1_$2', $name);
         $tokens = preg_split('/[^a-z0-9]+/', strtolower((string)$spaced), -1, PREG_SPLIT_NO_EMPTY);
+        // Phone tools arrive as phone-<name>; judge them by their own verb
+        if (strpos($name, 'phone-') === 0) array_shift($tokens);
         if (!$tokens || !in_array($tokens[0], self::READ_VERBS, true)) return false;
         return !array_intersect($tokens, self::DENY_TOKENS);
     }
@@ -227,7 +229,7 @@ class McpClient
 
             $tools[] = [
                 'name'         => $safe,
-                'description'  => substr('OpenWrt gateway: ' . trim((string)($t['description'] ?? $name)), 0, 1000),
+                'description'  => substr(trim((string)($t['description'] ?? $name)), 0, 1000),
                 'input_schema' => $schema,
             ];
             $map[$safe] = $name;
