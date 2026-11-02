@@ -12,7 +12,7 @@
 
 . /usr/share/libubox/jshn.sh
 
-VERSION=2.0
+VERSION=2.1
 KEY_FILE=/etc/sentinel/key
 UPS=1                      # 0 on boxes without the UPS HAT (D)
 LTE=1                      # 0 on boxes without the SIM7600
@@ -545,6 +545,12 @@ view_clients() {
 
 # ---------- view=logs ----------
 
+# Some daemons log secrets (ttyd prints its base64 user:password as "credential: ..."). Strip the value
+# after any such keyword so they never leave the box. Character classes keep this BusyBox-sed safe.
+redact() {
+	sed -E 's/([Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Pp][Aa][Ss][Ss][Ww]([Oo][Rr])?[Dd]|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee][_ -]?[Kk][Ee][Yy]|[Pp][Ii][Nn][Cc][Oo][Dd][Ee]|[Pp][Ss][Kk])([^A-Za-z0-9]{1,3}).*/\1\3[redacted]/'
+}
+
 view_logs() {
 	json_start
 	json_add_int lines "$lines"
@@ -553,7 +559,7 @@ view_logs() {
 	while IFS= read -r l; do
 		[ -n "$l" ] && json_add_string "" "$l"
 	done <<-EOF
-	$(logread 2>/dev/null | if [ -n "$filter" ]; then grep -iF -- "$filter"; else cat; fi | tail -n "$lines" | cut -c 1-300)
+	$(logread 2>/dev/null | if [ -n "$filter" ]; then grep -iF -- "$filter"; else cat; fi | tail -n "$lines" | redact | cut -c 1-300)
 	EOF
 	json_close_array
 	reply "200 OK"
@@ -580,7 +586,7 @@ view_dmesg() {
 		fi
 		json_add_string "" "$l"
 	done <<-EOF
-	$(dmesg 2>/dev/null | if [ -n "$filter" ]; then grep -iF -- "$filter"; else cat; fi | tail -n "$lines" | cut -c 1-300)
+	$(dmesg 2>/dev/null | if [ -n "$filter" ]; then grep -iF -- "$filter"; else cat; fi | tail -n "$lines" | redact | cut -c 1-300)
 	EOF
 	json_close_array
 	reply "200 OK"

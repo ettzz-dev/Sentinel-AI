@@ -184,6 +184,35 @@ NIGHT_GB=40
 The reply is cached for 30 minutes (`BALANCE_CACHE_S`). If the modem can't do USSD on LTE (no CSFB/IMS USSD on that
 cell), the tool still returns the counted figures with `operator_balance.error`.
 
+## 7. RouterPi system settings (applied 2026-11-02)
+
+Changes made on the Pi itself while fixing missing signal data, unexplained reboots and "internet down" history.
+They live in the Pi's config, not in this repo. Backups: `/etc/sentinel/backup-20261102-2129/`
+(`watchcat`, `lte-keepalive`, `network`, old `check-qmi-signal.sh`).
+
+| Setting | Was | Now | Why |
+| --- | --- | --- | --- |
+| WARP MTU (`network.cloudflare.mtu`) | 1420 | 1280 | Full-size WireGuard packets exceeded the LTE path MTU and were dropped: SSH stalled, large replies hung |
+| ModemManager | enabled | disabled | It probed `cdc-wdm0` while netifd's `uqmi` drove the same QMI port; `wwan0` stayed down with LTE "Online". It also left the modem in an invalid mode (`AT+CNMP: 1`) |
+| `network.wwan.modes` | unset | `lte,umts,gsm` | netifd sets the allowed modes on every connect, so a stray modem mode can't lock out LTE |
+| watchcat (6 jobs) | enabled | disabled | Reset `wwan` after 2–5 min (shorter than a cold LTE attach), rebuilt the network at 10/20 min (dropping WARP and the tunnel), and could reboot |
+| `lte-keepalive` | restart 3, reboot 9 | restart 5, reboot 20 | Single watchdog: ~10 min to an interface restart, ~40 min to a reboot |
+| `/usr/bin/check-qmi-signal.sh` | grep for `"rssi": -NN` | `jsonfilter -e @.rssi` | `uqmi` prints no space, so it never matched and emailed "modem unresponsive" every 6 h |
+| Timezone | UTC | Africa/Johannesburg (SAST-2) | History buckets and the night-data window use local time |
+| I2C (`/boot/config.txt`) | off | `dtparam=i2c_arm=on` | UPS HAT (D) INA219 at `i2c-1 0x43`; backup `/boot/config.txt.bak-sentinel` |
+| `kmod-hwmon-raspberrypi` | not installed | installed | Exposes `rpi_volt` (`pi_undervoltage` in status/history) and logs "Undervoltage detected!" |
+| Syslog (`system.log_file`) | RAM only, 128 KB | also `/root/syslog`, 512 KB + `.old` | Keeps the lead-up to a reboot |
+
+BusyBox on this image has no `timeout` applet (`/usr/bin/timeout` is a dangling link) and no `flock -w`; `sentinel-stats`
+works around both. From this PC, `ssh routerpi` needs `KexAlgorithms curve25519-sha256`: the default post-quantum key
+exchange doesn't fit through the WARP-over-LTE path.
+
+Open: the Pi rebooted during modem attach/radio restarts with nothing in the watchdog logs. Suspected brownout from the
+SIM7600's current spikes; the under-voltage flag and persistent syslog are there to confirm or rule it out.
+
+Also noted, not changed: `ttyd` logs its base64 `user:password` at startup (`sentinel-stats` redacts it in `logs`;
+change the ttyd password), and a leftover `cloudflared.apk-new` service crash-loops on an invalid token.
+
 ## Troubleshooting
 
 | Symptom | Cause |
@@ -197,4 +226,5 @@ cell), the tool still returns the counted figures with `operator_balance.error`.
 | `history`: `no history yet` | cron line missing or cron not running (`/etc/init.d/cron status`) |
 | every history row ends in `0` | NTP hook not firing. Check `/etc/hotplug.d/ntp/90-sentinel` and that NTP is enabled in System → Time |
 | `operator_balance.error: no USSD reply` | wrong code, the code opens a menu, or no USSD on LTE; counted figures still work |
+| a secret shows as `[redacted]` in `logs`/`dmesg` | intended: values after credential/password/token/secret/private key/pincode/psk keywords are stripped on the box |
 | `clients` has no `dhcp_leases` | DHCP served by something other than dnsmasq/odhcpd, or `luci-rpc` missing |
