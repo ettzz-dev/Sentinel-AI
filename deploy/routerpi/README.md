@@ -30,6 +30,7 @@ so the `?view=` query string needs no extra Access setup.
 | `get-routerpi-network` | `network` | interfaces, per-device traffic and current bit/s, routes, default route |
 | `get-routerpi-clients` | `clients` | DHCP leases, ARP neighbours, Wi-Fi stations |
 | `get-routerpi-logs` | `logs&lines=N&filter=TEXT` | recent `logread` lines (max 100) |
+| `get-routerpi-dmesg` | `dmesg&lines=N&filter=TEXT` | recent kernel messages, stamps converted to local time (max 100) |
 | `get-routerpi-history` | `history&hours=N` | reboots, outages, signal trends from the 5-minute samples (step 5) |
 | `get-routerpi-data-usage` | `usage` | Vodacom anytime/night usage this cycle, last 7 days, optional USSD balance (step 6) |
 
@@ -79,6 +80,9 @@ The SIM7600X has its own GNSS. The Waveshare GPS module should be the only thing
 7. **RF:** keep the GPS antenna 20–30 cm or more from the LTE antennas. Leave the SIM7600 HAT's GNSS antenna port unconnected.
 
 ## 3. Install the script
+
+Quickest: `scp -O deploy/routerpi/sentinel-stats deploy/routerpi/install.sh root@<pi>:/tmp/` then `ssh root@<pi> sh /tmp/install.sh routerpi`.
+It backs up the old script, keeps the key/config, self-tests and prints modem/I2C diagnostics. Manual steps:
 
 From this PC (the Pi's SSH goes through `rpissh.ettzz.app`, or use its LAN IP):
 
@@ -188,6 +192,7 @@ cell), the tool still returns the counted figures with `operator_balance.error`.
 | `Cloudflare Access rejected the Worker` | service token expired/revoked, or the `ROUTERPI_ACCESS_*` secrets don't match it |
 | `RouterPi tunnel is offline` | Pi off, or cloudflared has no LTE uplink |
 | `battery.error: no response from INA219` | I2C not enabled, or HAT not seated. Check `i2cdetect -y 1` |
+| `lte.source` is `modemmanager` or `qmi` | AT ports gave nothing (see `lte.note`); signal came from the fallback |
 | `lte` has only `cpsi_raw` | modem not on LTE (e.g. `NO SERVICE`, `WCDMA`); raw line is still returned |
 | `history`: `no history yet` | cron line missing or cron not running (`/etc/init.d/cron status`) |
 | every history row ends in `0` | NTP hook not firing. Check `/etc/hotplug.d/ntp/90-sentinel` and that NTP is enabled in System → Time |

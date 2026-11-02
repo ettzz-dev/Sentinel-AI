@@ -5,7 +5,7 @@ The ERX runs OpenWrt (25.12), so it uses the same read-only CGI as RouterPi:
 
 ```
 Sentinel (chat.php) ──MCP──> Worker "ai" (mcp.ettzz.pro)
-                                 │  get-erx-{status,network,clients,logs}
+                                 │  get-erx-{status,network,clients,logs,dmesg}
                                  ▼  CF-Access-Client-Id/Secret (service token "Sentinel-ERX")
                                  ▼  Authorization: Bearer <ERX_KEY>
                      https://erx.ettzz.app/cgi-bin/sentinel-stats
@@ -71,9 +71,12 @@ hostname on that tunnel at `http://<erx-lan-ip>:80` with the same path instead.
 
 ## 3. Access
 
+Set up 2026-11-02. The tunnel ingress sends all of `erx.ettzz.app` to uhttpd, so the second app is what keeps LuCI private.
+
 | Access app | Domain | Policy |
 | --- | --- | --- |
-| ERX Sentinel Stats | `erx.ettzz.app/cgi-bin/sentinel-stats` | Service Auth: new token `Sentinel-ERX` |
+| ERX Sentinel Stats | `erx.ettzz.app/cgi-bin/sentinel-stats` | Service Auth: token `Sentinel-ERX` (expires 2027-11-01) |
+| ERX LuCI | `erx.ettzz.app` | Allow: ettzz@pm.me (login) |
 
 ## 4. Worker secrets
 

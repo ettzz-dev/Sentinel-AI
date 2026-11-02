@@ -6,16 +6,19 @@
 # RouterPi requires: i2c-tools, sms-tool, kmod-i2c-bcm2835 (see deploy/routerpi/README.md)
 # Auth:   "Authorization: Bearer <key>", key stored in /etc/sentinel/key
 # Views:  ?view=status (default) | network | clients | logs&lines=N&filter=TEXT
-#         | history&hours=N | usage
+#         | dmesg&lines=N&filter=TEXT | history&hours=N | usage
 # Cron:   "sentinel-stats --sample" appends one row to HISTORY_FILE (RouterPi, every 5 minutes)
 # Override any setting below in /etc/sentinel/config
 
 . /usr/share/libubox/jshn.sh
 
+VERSION=2.0
 KEY_FILE=/etc/sentinel/key
 UPS=1                      # 0 on boxes without the UPS HAT (D)
 LTE=1                      # 0 on boxes without the SIM7600
 AT_PORT=/dev/ttyUSB2       # SIM7600 AT port. ttyUSB1 is its NMEA/GNSS port: never touched here
+AT_PORT_ALT=/dev/ttyUSB3   # SIM7600's second AT port, tried when AT_PORT gives no answer
+QMI_DEV=/dev/cdc-wdm0      # QMI control device, fallback signal source (uqmi)
 I2C_BUS=1
 UPS_ADDR=0x43              # Waveshare UPS HAT (D) INA219
 SHUNT_MOHM=10              # 0.01 ohm shunt on Waveshare UPS HATs
@@ -43,6 +46,24 @@ reply() {
 	echo
 }
 
+# Run "$@" with a time limit. Some BusyBox builds have no timeout applet (RouterPi even has a dangling
+# /usr/bin/timeout -> busybox link), so test that it really runs, else fall back to a watchdog
+if timeout 1 true >/dev/null 2>&1; then
+	tmo() { timeout "$@"; }
+else
+	tmo() {
+		_t=$1; shift
+		"$@" &
+		_c=$!
+		# watchdog must not hold the caller's stdout open, or $(...) waits for the sleep
+		( sleep "$_t"; kill "$_c" 2>/dev/null ) >/dev/null 2>&1 &
+		_w=$!
+		wait "$_c"; _rc=$?
+		kill "$_w" 2>/dev/null
+		return $_rc
+	}
+fi
+
 is_int() { case "$1" in ''|-|*[!0-9-]*) return 1 ;; esac; }
 tenths() { is_int "$1" && awk -v v="$1" 'BEGIN{printf "%.1f", v/10}'; }
 local_time() { date -d "@$1" '+%Y-%m-%d %H:%M'; }
@@ -54,6 +75,7 @@ json_start() {
 	json_add_int timestamp "$now"
 	json_add_string time_local "$(local_time "$now")"
 	json_add_string hostname "$hostname"
+	json_add_string script_version "$VERSION"
 }
 
 # ---------- readers: set shell variables, print nothing ----------
@@ -89,25 +111,64 @@ read_system() {
 
 # UPS HAT (D): INA219, read-only (no config writes)
 # SMBus words are little-endian, INA219 registers are big-endian: swap bytes
-ina_word() {
-	v=$(i2cget -y "$I2C_BUS" "$UPS_ADDR" "$1" w 2>/dev/null) || return 1
+ina_word() {   # bus addr reg
+	v=$(i2cget -y "$1" "$2" "$3" w 2>/dev/null) || return 1
 	v=$((v))
 	echo $(( ((v & 0xff) << 8) | (v >> 8) ))
 }
 
+# A bus-voltage register reading that looks like a 1-cell Li-ion pack (2.5-4.5 V)
+ina_probe() {   # bus addr
+	b=$(ina_word "$1" "$2" 0x02) || return 1
+	b=$(( (b >> 3) * 4 ))
+	[ "$b" -ge 2500 ] && [ "$b" -le 4500 ]
+}
+
 read_battery() {
-	batt_err= mv= ma= pct= state=
-	if ! command -v i2cget >/dev/null; then
-		batt_err="i2c-tools not installed"
-		return
+	batt_err= batt_src= mv= ma= pct= state=
+	# 1. Kernel ina2xx driver bound to the chip: i2cget would get EBUSY, read hwmon instead
+	for h in /sys/class/hwmon/hwmon*; do
+		case "$(cat "$h/name" 2>/dev/null)" in ina219|ina2*) ;; *) continue ;; esac
+		mv=$(cat "$h/in1_input" 2>/dev/null)
+		ma=$(cat "$h/curr1_input" 2>/dev/null)
+		if is_int "$mv"; then
+			is_int "$ma" || ma=0
+			ma=$(( CURRENT_SIGN * ma ))
+			batt_src="hwmon ${h##*/}"
+			break
+		fi
+		mv=
+	done
+	# 2. Raw registers: configured bus/address first, then the other buses and INA219 addresses
+	if [ -z "$batt_src" ]; then
+		if ! command -v i2cget >/dev/null; then
+			batt_err="i2c-tools not installed"
+			return
+		fi
+		found=
+		if ina_probe "$I2C_BUS" "$UPS_ADDR"; then
+			found="$I2C_BUS $UPS_ADDR"
+		else
+			for dev in /dev/i2c-*; do
+				[ -c "$dev" ] || continue
+				for a in "$UPS_ADDR" 0x40 0x41 0x42 0x43 0x44 0x45; do
+					ina_probe "${dev#/dev/i2c-}" "$a" && { found="${dev#/dev/i2c-} $a"; break 2; }
+				done
+			done
+		fi
+		if [ -z "$found" ]; then
+			buses=$(ls /dev/i2c-* 2>/dev/null | tr '\n' ' ')
+			batt_err="no INA219 found (tried i2c-$I2C_BUS $UPS_ADDR, then 0x40-0x45 on: ${buses:-no /dev/i2c-* devices, is I2C enabled?})"
+			return
+		fi
+		set -- $found
+		bus=$(ina_word "$1" "$2" 0x02) && shunt=$(ina_word "$1" "$2" 0x01) || { batt_err="INA219 at $2 on i2c-$1 stopped answering"; return; }
+		mv=$(( (bus >> 3) * 4 ))                 # bus voltage, 4 mV per bit
+		[ "$shunt" -gt 32767 ] && shunt=$(( shunt - 65536 ))
+		ma=$(( CURRENT_SIGN * shunt * 10 / SHUNT_MOHM ))   # shunt LSB is 10 uV
+		batt_src="i2c-$1 $2"
+		[ "$1 $2" != "$I2C_BUS $UPS_ADDR" ] && batt_src="$batt_src (set I2C_BUS=$1 UPS_ADDR=$2 in /etc/sentinel/config)"
 	fi
-	if ! bus=$(ina_word 0x02) || ! shunt=$(ina_word 0x01); then
-		batt_err="no response from INA219 at $UPS_ADDR on i2c-$I2C_BUS"
-		return
-	fi
-	mv=$(( (bus >> 3) * 4 ))                 # bus voltage, 4 mV per bit
-	[ "$shunt" -gt 32767 ] && shunt=$(( shunt - 65536 ))
-	ma=$(( CURRENT_SIGN * shunt * 10 / SHUNT_MOHM ))   # shunt LSB is 10 uV
 	pct=$(( (mv - BATT_EMPTY_MV) * 100 / (BATT_FULL_MV - BATT_EMPTY_MV) ))
 	[ "$pct" -lt 0 ] && pct=0
 	[ "$pct" -gt 100 ] && pct=100
@@ -118,25 +179,100 @@ read_battery() {
 
 # SIM7600 via AT, query commands only.
 # Lock so concurrent requests (and the cron sampler) never interleave on the AT port
-at() { timeout 5 sms-tool -d "$AT_PORT" at "$1" 2>/dev/null | tr -d '\r' | grep "^+"; }
+# BusyBox flock has no -w: poll -n for up to $1 seconds
+lock_wait() {
+	i=0
+	while ! flock -n 9; do
+		i=$((i + 1))
+		[ "$i" -gt "$(( $1 * 4 ))" ] && return 1
+		sleep 0.25
+	done
+}
+
+at() { tmo 5 sms-tool -d "$port" at "$1" 2>/dev/null | tr -d '\r' | grep "^+"; }
+
+# Signal via ModemManager when it owns the modem (it holds the AT ports, so AT queries get nothing back)
+read_lte_mm() {
+	command -v mmcli >/dev/null || return 1
+	kv=$(tmo 6 mmcli -m any -K 2>/dev/null) || return 1
+	[ -n "$kv" ] || return 1
+	mmv() { echo "$kv" | sed -n "s/^$1 *: *//p" | head -n 1 | sed 's/^--$//'; }
+	op=$(mmv 'modem\.3gpp\.operator-name')
+	plmn=$(mmv 'modem\.3gpp\.operator-code')
+	status=$(mmv 'modem\.generic\.state')
+	case "$status" in connected|registered) status=Online ;; esac   # same meaning as AT+CPSI "Online" (history counts on it)
+	acc=$(mmv 'modem\.generic\.access-technologies\.value\[1\]')
+	mode=$(echo "${acc:-unknown}" | tr a-z A-Z)
+	q=$(mmv 'modem\.generic\.signal-quality\.value')
+	is_int "$q" && signal_pct=$q
+	# Detailed values only if signal polling was set up (mmcli -m any --signal-setup=30)
+	sg=$(tmo 6 mmcli -m any --signal-get -K 2>/dev/null)
+	r() { echo "$sg" | sed -n "s/^modem\.signal\.lte\.$1 *: *//p" | head -n 1 | grep -E '^-?[0-9.]+$'; }
+	rsrp=$(r rsrp); rsrq=$(r rsrq); rssi=$(r rssi); sinr=$(r snr)
+	sinr=${sinr%.*}
+	lte_src=modemmanager
+	[ -n "$rsrp" ] || lte_note="ModemManager gives only a 0-100% quality. For RSRP/SINR run once: mmcli -m any --signal-setup=30"
+	return 0
+}
+
+# Signal via QMI (uqmi), when the modem runs in QMI mode
+read_lte_qmi() {
+	command -v uqmi >/dev/null && [ -c "$QMI_DEV" ] || return 1
+	si=$(tmo 6 uqmi -s -d "$QMI_DEV" --get-signal-info 2>/dev/null)
+	[ -n "$si" ] || return 1
+	t=$(echo "$si" | jsonfilter -e '@.type' 2>/dev/null)
+	[ -n "$t" ] || return 1
+	mode=$(echo "$t" | tr a-z A-Z)
+	rsrp=$(echo "$si" | jsonfilter -e '@.rsrp' 2>/dev/null)
+	rsrq=$(echo "$si" | jsonfilter -e '@.rsrq' 2>/dev/null)
+	rssi=$(echo "$si" | jsonfilter -e '@.rssi' 2>/dev/null)
+	sinr=$(echo "$si" | jsonfilter -e '@.snr' 2>/dev/null)
+	sinr=${sinr%.*}
+	ss=$(tmo 6 uqmi -s -d "$QMI_DEV" --get-serving-system 2>/dev/null)
+	op=$(echo "$ss" | jsonfilter -e '@.plmn_description' 2>/dev/null)
+	m=$(echo "$ss" | jsonfilter -e '@.plmn_mcc' 2>/dev/null); n=$(echo "$ss" | jsonfilter -e '@.plmn_mnc' 2>/dev/null)
+	[ -n "$m" ] && plmn=$(printf '%s-%02d' "$m" "$n")
+	status=$(echo "$ss" | jsonfilter -e '@.registration' 2>/dev/null)
+	[ "$status" = registered ] && status=Online
+	lte_src=qmi
+	return 0
+}
 
 read_lte() {
-	lte_err= csq_dbm= op= line= mode= status= plmn= cell= pci= band= earfcn= rsrp= rsrq= rssi= sinr= gnss=
+	lte_err= lte_note= lte_src= csq_dbm= signal_pct= op= line= mode= status= plmn= cell= pci= band= earfcn= rsrp= rsrq= rssi= sinr= gnss=
+	csq= cpsi= cops= cgps= at_why=
 	if ! command -v sms-tool >/dev/null; then
-		lte_err="sms-tool not installed"
-		return
+		at_why="sms-tool not installed"
+	elif [ ! -c "$AT_PORT" ] && [ ! -c "$AT_PORT_ALT" ]; then
+		at_why="no AT port ($AT_PORT, $AT_PORT_ALT): modem not on USB, or option driver missing (kmod-usb-serial-option)"
+	else
+		exec 9>/var/lock/sentinel-at.lock
+		if lock_wait 8; then
+			for port in "$AT_PORT" "$AT_PORT_ALT"; do
+				[ -c "$port" ] || continue
+				csq=$(at "AT+CSQ")
+				[ -n "$csq" ] || continue
+				cpsi=$(at "AT+CPSI?")
+				cops=$(at "AT+COPS?")
+				cgps=$(at "AT+CGPS?")
+				lte_src="at $port"
+				break
+			done
+			flock -u 9
+			[ -n "$lte_src" ] || at_why="no AT reply on $AT_PORT or $AT_PORT_ALT"
+		else
+			at_why="AT port busy (lock held over 8 s)"
+		fi
 	fi
-	if [ ! -c "$AT_PORT" ]; then
-		lte_err="AT port $AT_PORT not found"
+
+	if [ -z "$lte_src" ]; then
+		if read_lte_mm || read_lte_qmi; then
+			lte_note="${lte_note:+$lte_note. }AT failed ($at_why), used $lte_src"
+		else
+			pgrep -x ModemManager >/dev/null 2>&1 && at_why="$at_why; ModemManager is running and may hold the AT ports, but mmcli gave nothing"
+			lte_err="$at_why; no ModemManager or QMI fallback answered"
+		fi
 		return
-	fi
-	exec 9>/var/lock/sentinel-at.lock
-	if flock -w 8 9; then
-		csq=$(at "AT+CSQ")
-		cpsi=$(at "AT+CPSI?")
-		cops=$(at "AT+COPS?")
-		cgps=$(at "AT+CGPS?")
-		flock -u 9
 	fi
 
 	# +CSQ: <rssi>,<ber>  -> dBm = -113 + 2*rssi (99 = unknown)
@@ -205,6 +341,7 @@ view_status() {
 		if [ -n "$batt_err" ]; then
 			json_add_string error "$batt_err"
 		else
+			json_add_string source "$batt_src"
 			json_add_double voltage_v "$(awk -v v="$mv" 'BEGIN{printf "%.3f", v/1000}')"
 			json_add_int current_ma "$ma"
 			json_add_int power_mw $(( mv * (ma < 0 ? -ma : ma) / 1000 ))
@@ -220,22 +357,23 @@ view_status() {
 		if [ -n "$lte_err" ]; then
 			json_add_string error "$lte_err"
 		else
+			json_add_string source "$lte_src"
+			[ -n "$lte_note" ] && json_add_string note "$lte_note"
 			[ -n "$csq_dbm" ] && json_add_int csq_rssi_dbm "$csq_dbm"
+			[ -n "$signal_pct" ] && json_add_int signal_quality_pct "$signal_pct"
 			[ -n "$op" ] && json_add_string operator "$op"
-			json_add_string cpsi_raw "$line"
+			[ -n "$line" ] && json_add_string cpsi_raw "$line"
 			json_add_string network_mode "${mode:-unknown}"
-			if [ "$mode" = "LTE" ]; then
-				json_add_string status "$status"
-				json_add_string plmn "$plmn"
-				json_add_string cell_id "$cell"
-				is_int "$pci" && json_add_int pci "$pci"
-				json_add_string band "$band"
-				is_int "$earfcn" && json_add_int earfcn "$earfcn"
-				[ -n "$rsrp" ] && json_add_double rsrp_dbm "$rsrp"
-				[ -n "$rsrq" ] && json_add_double rsrq_db "$rsrq"
-				[ -n "$rssi" ] && json_add_double rssi_dbm "$rssi"
-				[ -n "$sinr" ] && json_add_int sinr_db "$sinr"
-			fi
+			[ -n "$status" ] && json_add_string status "$status"
+			[ -n "$plmn" ] && json_add_string plmn "$plmn"
+			[ -n "$cell" ] && json_add_string cell_id "$cell"
+			is_int "$pci" && json_add_int pci "$pci"
+			[ -n "$band" ] && json_add_string band "$band"
+			is_int "$earfcn" && json_add_int earfcn "$earfcn"
+			[ -n "$rsrp" ] && json_add_double rsrp_dbm "$rsrp"
+			[ -n "$rsrq" ] && json_add_double rsrq_db "$rsrq"
+			[ -n "$rssi" ] && json_add_double rssi_dbm "$rssi"
+			[ -n "$sinr" ] && json_add_int sinr_db "$sinr"
 			[ -n "$gnss" ] && json_add_string modem_gnss "$gnss"
 		fi
 		json_close_object
@@ -422,6 +560,33 @@ view_logs() {
 	json_dump
 }
 
+# ---------- view=dmesg ----------
+# Kernel ring buffer. Busybox dmesg has no -T, so each "[secs]" stamp is turned into local time
+# from the boot time (now - uptime). Stamps before an NTP step on the Pi (no RTC) can be off.
+
+view_dmesg() {
+	read_basic
+	boot=$(( now - uptime_s ))
+	json_start
+	json_add_int lines "$lines"
+	[ -n "$filter" ] && json_add_string filter "$filter"
+	json_add_string booted_local "$(local_time "$boot")"
+	json_add_array log
+	while IFS= read -r l; do
+		[ -n "$l" ] || continue
+		s=$(echo "$l" | sed -n 's/^\[ *\([0-9]*\)\.[0-9]*\].*/\1/p')
+		if [ -n "$s" ]; then
+			l="$(date -d "@$(( boot + s ))" '+%m-%d %H:%M:%S') ${l#*] }"
+		fi
+		json_add_string "" "$l"
+	done <<-EOF
+	$(dmesg 2>/dev/null | if [ -n "$filter" ]; then grep -iF -- "$filter"; else cat; fi | tail -n "$lines" | cut -c 1-300)
+	EOF
+	json_close_array
+	reply "200 OK"
+	json_dump
+}
+
 # ---------- cron: --sample ----------
 # History columns:
 #  1 ts  2 local_time  3 boot_id  4 uptime_s  5 network_mode  6 lte_status  7 rsrp_dbm  8 rsrq_db
@@ -532,8 +697,8 @@ balance() {
 	else
 		bal_cached=0
 		exec 9>/var/lock/sentinel-at.lock
-		flock -w 8 9 || return
-		out=$(timeout 12 sms-tool -d "$AT_PORT" ussd "$BALANCE_USSD" 2>/dev/null | tr -d '\r')
+		lock_wait 8 || return
+		out=$(tmo 12 sms-tool -d "$AT_PORT" ussd "$BALANCE_USSD" 2>/dev/null | tr -d '\r')
 		flock -u 9
 		[ -n "$out" ] || return
 		printf '%s' "$out" > "$cache"
@@ -673,6 +838,7 @@ status) view_status ;;
 network) view_network ;;
 clients) view_clients ;;
 logs) view_logs ;;
+dmesg) view_dmesg ;;
 history) view_history ;;
 usage) view_usage ;;
 *)

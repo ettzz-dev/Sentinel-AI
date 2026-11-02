@@ -93,8 +93,8 @@ const LOG_ARGS = {
     },
   },
 };
-const logParams = (a) => ({
-  view: "logs",
+const logParams = (view) => (a) => ({
+  view,
   lines: clampInt(a.lines, 40, 1, 100),
   filter: typeof a.filter === "string" ? a.filter.replace(/[^A-Za-z0-9 ._:\/-]/g, "").slice(0, 64) : "",
 });
@@ -121,8 +121,17 @@ const openwrtTools = (id, who) => [
     name: `get-${id}-logs`,
     device: id,
     inputSchema: LOG_ARGS,
-    params: logParams,
+    params: logParams("logs"),
     description: `${who}: recent system log lines (logread), oldest first, optionally filtered by text. Use it to diagnose problems. Read-only.`,
+  },
+  {
+    name: `get-${id}-dmesg`,
+    device: id,
+    inputSchema: LOG_ARGS,
+    params: logParams("dmesg"),
+    description:
+      `${who}: recent kernel messages (dmesg), oldest first, with local timestamps, optionally filtered by text ` +
+      '(e.g. "usb", "ttyUSB", "i2c", "qmi", "oom", "error"). Use it for hardware, driver, USB modem and crash problems. Read-only.',
   },
 ];
 
@@ -188,7 +197,7 @@ const HANDLERS = {
   "test-tool": async () => "MCP is working 🚀",
   "get-system-health": async () =>
     JSON.stringify({ time: new Date().toISOString(), status: "online", region: "Cloudflare Edge" }, null, 2),
-  "whoami": async () => "I am Sentinel MCP v1.3",
+  "whoami": async () => "I am Sentinel MCP v1.4",
   "check-tunnels": async (env) => {
     if (!env.CF_ACCOUNT_ID || !env.CF_API_TOKEN) {
       return "Worker is missing the CF_ACCOUNT_ID or CF_API_TOKEN secret.";
@@ -334,7 +343,7 @@ export default {
         return ok({
           protocolVersion: "2025-03-26",
           capabilities: { tools: {} },
-          serverInfo: { name: "sentinel-mcp", version: "1.3" },
+          serverInfo: { name: "sentinel-mcp", version: "1.4" },
         });
       case "notifications/initialized":
         return new Response(null, { status: 202 });
