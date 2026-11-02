@@ -210,6 +210,12 @@ exchange doesn't fit through the WARP-over-LTE path.
 Open: the Pi rebooted during modem attach/radio restarts with nothing in the watchdog logs. Suspected brownout from the
 SIM7600's current spikes; the under-voltage flag and persistent syslog are there to confirm or rule it out.
 
+Planned reboots: run `mreboot` on the Pi (`/usr/bin/mreboot`, the user's script). It asks for a reason, appends
+`YYYY-mm-dd HH:MM:SS | MANUAL REBOOT | Note: <reason>` to `/etc/router_maintenance.log` and reboots. `get-routerpi-status`
+returns `boot.booted_local` and the last `MAINT_LINES` (5) log lines, and Sentinel's prompt (`api/chat.php`) matches them
+against the boot time before calling a reboot unexpected. Both files are in `/etc/sysupgrade.conf`. Reboots done any other
+way (LuCI, plain `reboot`) leave no note and count as unexpected.
+
 Also noted, not changed: `ttyd` logs its base64 `user:password` at startup (`sentinel-stats` redacts it in `logs`;
 change the ttyd password), and a leftover `cloudflared.apk-new` service crash-loops on an invalid token.
 

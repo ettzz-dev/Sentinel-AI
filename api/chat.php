@@ -232,7 +232,14 @@ try {
             $mcpNote .= ' RouterPi is the OpenWrt Raspberry Pi in the car (UPS HAT battery, SIM7600 LTE modem, separate GPS module). '
                       . 'Use owrt_get-routerpi-status for its battery, LTE signal, CPU, memory, temperature or uptime. '
                       . 'LTE RSRP guide: >= -80 dBm excellent, -80 to -90 good, -90 to -100 fair, < -100 poor; SINR > 20 dB excellent, 13-20 good, 0-13 fair, < 0 poor. '
-                      . 'If the tool fails, say the car may be off or out of coverage rather than guessing values.';
+                      . 'If the tool fails, say the car may be off or out of coverage rather than guessing values. '
+                      . 'MANUAL REBOOTS: the user reboots RouterPi on purpose with the mreboot command, which writes a line like '
+                      . '"2026-11-02 22:48:39 | MANUAL REBOOT | Note: <reason>" to /etc/router_maintenance.log. owrt_get-routerpi-status returns the latest lines '
+                      . 'in boot.maintenance_log, next to boot.booted_local (boot time). Whenever the uptime is low or history shows a reboot, check these first, '
+                      . 'before you diagnose a crash, power or signal problem: if a MANUAL REBOOT entry falls within a few minutes before the boot time, say so plainly '
+                      . '(e.g. "RouterPi restarted 4 minutes ago; your log says it was a manual reboot to update configurations, so this was expected") and quote the note. '
+                      . 'Only treat a reboot as unexpected when no entry matches its time. If boot.clock_synced is false the boot time may be off, so allow a wider match. '
+                      . 'Apply the same check to reboot events in owrt_get-routerpi-history (compare first_sample_after and uptime_s_then with the log times).';
         }
         if (isset($mcpMap['owrt_get-routerpi-history'])) {
             $mcpNote .= ' owrt_get-routerpi-history is recorded on the Pi every 5 minutes, so it covers times the tunnel was down. '

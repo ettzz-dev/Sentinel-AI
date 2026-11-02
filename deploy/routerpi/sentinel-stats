@@ -12,7 +12,7 @@
 
 . /usr/share/libubox/jshn.sh
 
-VERSION=2.1
+VERSION=2.2
 KEY_FILE=/etc/sentinel/key
 UPS=1                      # 0 on boxes without the UPS HAT (D)
 LTE=1                      # 0 on boxes without the SIM7600
@@ -37,6 +37,8 @@ NIGHT_GB=40
 NIGHT_START=0              # night bundle window in local hours: [start, end)
 NIGHT_END=5
 BILL_DAY=1                 # first day of the billing cycle
+MAINT_LOG=/etc/router_maintenance.log   # written by mreboot: "YYYY-mm-dd HH:MM:SS | MANUAL REBOOT | Note: ..."
+MAINT_LINES=5
 [ -f /etc/sentinel/config ] && . /etc/sentinel/config
 
 reply() {
@@ -333,6 +335,24 @@ view_status() {
 		json_add_int overlay_free_kb "$disk_free"
 	}
 	[ -n "$undervolt" ] && json_add_boolean pi_undervoltage "$undervolt"
+	json_close_object
+
+	# Boot time plus the user's own notes on planned reboots, so a fresh uptime can be matched to a reason
+	json_add_object boot
+	json_add_string booted_local "$(local_time $(( now - uptime_s )))"
+	json_add_string boot_id "$boot_id"
+	json_add_boolean clock_synced "$([ -f "$NTP_MARK" ] && echo 1 || echo 0)"
+	if [ -s "$MAINT_LOG" ]; then
+		json_add_array maintenance_log
+		while IFS= read -r l; do
+			[ -n "$l" ] && json_add_string "" "$l"
+		done <<-EOF
+		$(tail -n "$MAINT_LINES" "$MAINT_LOG" | cut -c 1-300)
+		EOF
+		json_close_array
+	else
+		json_add_string maintenance_log_note "no entries in $MAINT_LOG"
+	fi
 	json_close_object
 
 	if [ "$UPS" = 1 ]; then
