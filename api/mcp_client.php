@@ -30,6 +30,16 @@ class McpClient
         'install', 'block', 'unblock', 'kick', 'disconnect', 'wipe', 'push', 'send',
     ];
 
+    // Read-only tools of the Galaxy S23 app (android-remote-control-mcp). Deliberately left out:
+    // every tap/type/gesture/open/close/intent tool, file writes, notification actions,
+    // android_get_shared_content (it clears what it returns) and the camera capture tools.
+    private const PHONE_READ_TOOLS = [
+        'android_get_screen_state', 'android_find_nodes', 'android_get_node_details',
+        'android_get_clipboard', 'android_notification_list', 'android_get_location',
+        'android_list_apps', 'android_list_storage_locations', 'android_list_files', 'android_read_file',
+        'android_list_cameras', 'android_list_camera_photo_resolutions', 'android_list_camera_video_resolutions',
+    ];
+
     public static function env(string $key): string
     {
         $v = $_SERVER[$key] ?? $_SERVER['REDIRECT_' . $key] ?? $_ENV[$key] ?? getenv($key);
@@ -200,10 +210,13 @@ class McpClient
         if ($allow !== '') {
             return in_array($name, array_map('trim', explode(',', $allow)), true);
         }
+        // Phone tools arrive as phone-<name>. The phone app can tap, type, open apps and use the
+        // camera, so only an explicit list of read-only tools is exposed instead of guessing by verb.
+        if (strpos($name, 'phone-') === 0) {
+            return in_array(substr($name, 6), self::PHONE_READ_TOOLS, true);
+        }
         $spaced = preg_replace('/([a-z0-9])([A-Z])/', '$1_$2', $name);
         $tokens = preg_split('/[^a-z0-9]+/', strtolower((string)$spaced), -1, PREG_SPLIT_NO_EMPTY);
-        // Phone tools arrive as phone-<name>; judge them by their own verb
-        if (strpos($name, 'phone-') === 0) array_shift($tokens);
         if (!$tokens || !in_array($tokens[0], self::READ_VERBS, true)) return false;
         return !array_intersect($tokens, self::DENY_TOKENS);
     }

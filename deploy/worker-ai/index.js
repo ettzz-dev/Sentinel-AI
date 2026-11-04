@@ -4,8 +4,8 @@
 //   RouterPi   ROUTERPI_KEY, ROUTERPI_ACCESS_ID / ROUTERPI_ACCESS_SECRET (token "Sentinel-RouterPi"), optional ROUTERPI_URL
 //   ERX        ERX_KEY, ERX_ACCESS_ID / ERX_ACCESS_SECRET (token "Sentinel-ERX"), optional ERX_URL
 //   Azure VPS  AZURE_KEY, AZURE_ACCESS_ID / AZURE_ACCESS_SECRET (token "Sentinel-AzureVPS"), optional AZURE_URL
-// Phone MCP (Galaxy, Termux tunnel): secret PHONE_MCP_TOKEN (Bearer token from the Phone MCP app);
-//          optional PHONE_MCP_URL, PHONE_ACCESS_ID / PHONE_ACCESS_SECRET if Access is put in front of it.
+// Phone MCP (Galaxy S23, android-remote-control-mcp, Streamable HTTP): secret PHONE_MCP_TOKEN (Bearer token from the app);
+//          optional PHONE_MCP_URL (default https://s23.ettzz.app/mcp), PHONE_ACCESS_ID / PHONE_ACCESS_SECRET if Access is put in front of it.
 // The phone's tools are re-exported live as "phone-<name>", so enabling a feature in the app is enough.
 
 const PHONE_PREFIX = "phone-";
@@ -217,81 +217,62 @@ for (const t of DEVICE_TOOLS) {
   HANDLERS[t.name] = (env, args) => queryDevice(env, t.device, t.params ? t.params(args) : {}, t.timeoutMs);
 }
 
-// ---------- Phone MCP bridge (legacy SSE transport: GET /sse, then POST to the announced endpoint) ----------
+// ---------- Phone MCP bridge (Streamable HTTP: POST JSON-RPC to /mcp, reply is JSON or an SSE stream) ----------
 
 async function phoneRequest(env, method, params, timeoutMs = 15000) {
   if (!env.PHONE_MCP_TOKEN) throw new Error("Worker is missing the PHONE_MCP_TOKEN secret.");
-  const sseUrl = env.PHONE_MCP_URL || "https://galaxy-mcp.ettzz.pro/sse";
-  const headers = { Authorization: `Bearer ${env.PHONE_MCP_TOKEN}` };
+  const url = env.PHONE_MCP_URL || "https://s23.ettzz.app/mcp";
+  const headers = {
+    Authorization: `Bearer ${env.PHONE_MCP_TOKEN}`,
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+  };
   if (env.PHONE_ACCESS_ID && env.PHONE_ACCESS_SECRET) {
     headers["CF-Access-Client-Id"] = env.PHONE_ACCESS_ID;
     headers["CF-Access-Client-Secret"] = env.PHONE_ACCESS_SECRET;
   }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let nextId = 0;
 
-  let reader;
-  try {
-    const res = await fetch(sseUrl, { headers: { ...headers, Accept: "text/event-stream" }, signal: ctrl.signal });
-    if (res.status === 530 || res.status === 502) throw new Error("Phone tunnel is offline (phone asleep, Termux stopped, or no data).");
+  const post = async (payload) => {
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload), signal: ctrl.signal });
+    const sid = res.headers.get("mcp-session-id");
+    if (sid) headers["Mcp-Session-Id"] = sid;
+    if (res.status === 530 || res.status === 502) throw new Error("Phone tunnel is offline (phone asleep, app stopped, or no data).");
     if (res.status === 401) throw new Error("Phone MCP rejected the token (check PHONE_MCP_TOKEN against the app).");
-    if (!res.ok || !res.body) throw new Error(`Phone MCP returned HTTP ${res.status}.`);
-    reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    if (res.status === 403) throw new Error("Phone MCP blocked by Cloudflare Access (check PHONE_ACCESS_ID / PHONE_ACCESS_SECRET).");
+    if (!res.ok) throw new Error(`Phone MCP ${payload.method} failed: HTTP ${res.status}`);
+    return res;
+  };
 
-    let buf = "";
-    const nextEvent = async () => {
-      for (;;) {
-        const end = buf.indexOf("\n\n");
-        if (end !== -1) {
-          const raw = buf.slice(0, end);
-          buf = buf.slice(end + 2);
-          let event = "message", data = "";
-          for (const line of raw.split("\n")) {
-            if (line.startsWith("event:")) event = line.slice(6).trim();
-            else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).trimStart();
-          }
-          if (data) return { event, data };
-          continue; // comment / keep-alive
-        }
-        const { value, done } = await reader.read();
-        if (done) throw new Error("Phone MCP closed the stream.");
-        buf += value.replace(/\r\n?/g, "\n");
+  const rpc = async (m, p) => {
+    const id = ++nextId;
+    const res = await post({ jsonrpc: "2.0", id, method: m, params: p });
+    const text = await res.text();
+    let msg = null;
+    if ((res.headers.get("content-type") || "").includes("text/event-stream")) {
+      for (const block of text.replace(/\r\n?/g, "\n").split("\n\n")) {
+        const data = block.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart()).join("\n");
+        if (!data) continue;
+        try {
+          const d = JSON.parse(data);
+          if (d.id === id) msg = d;
+        } catch {}
       }
-    };
+    } else {
+      try { msg = JSON.parse(text); } catch {}
+    }
+    if (!msg) throw new Error(`Phone MCP sent an unreadable reply to ${m}.`);
+    if (msg.error) throw new Error(`Phone MCP: ${msg.error.message || JSON.stringify(msg.error)}`);
+    return msg.result;
+  };
 
-    let ev;
-    do ev = await nextEvent(); while (ev.event !== "endpoint");
-    const postUrl = new URL(ev.data, sseUrl).toString();
-
-    let nextId = 0;
-    const post = async (payload) => {
-      const r = await fetch(postUrl, {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: ctrl.signal,
-      });
-      if (!r.ok) throw new Error(`Phone MCP POST ${payload.method} failed: HTTP ${r.status}`);
-    };
-    // Responses arrive on the SSE stream, not in the POST reply
-    const rpc = async (m, p) => {
-      const id = ++nextId;
-      await post({ jsonrpc: "2.0", id, method: m, params: p });
-      for (;;) {
-        const e = await nextEvent();
-        if (e.event !== "message") continue;
-        let msg;
-        try { msg = JSON.parse(e.data); } catch { continue; }
-        if (msg.id !== id) continue;
-        if (msg.error) throw new Error(`Phone MCP: ${msg.error.message || JSON.stringify(msg.error)}`);
-        return msg.result;
-      }
-    };
-
+  try {
     await rpc("initialize", {
-      protocolVersion: "2024-11-05",
+      protocolVersion: "2025-03-26",
       capabilities: {},
-      clientInfo: { name: "sentinel-mcp-bridge", version: "1.2" },
+      clientInfo: { name: "sentinel-mcp-bridge", version: "2.0" },
     });
     await post({ jsonrpc: "2.0", method: "notifications/initialized" });
     return await rpc(method, params);
@@ -300,8 +281,6 @@ async function phoneRequest(env, method, params, timeoutMs = 15000) {
     throw e;
   } finally {
     clearTimeout(timer);
-    reader?.cancel().catch(() => {});
-    ctrl.abort();
   }
 }
 
